@@ -6,14 +6,22 @@ export type Look = {
   warmth: number;
   contrast: number;
   isolate: boolean;
+  labTransfer: boolean;
   referenceStrength: number;
   referencePersonMean: [number, number, number];
   referencePersonStd: [number, number, number];
   referenceBackgroundMean: [number, number, number];
   referenceBackgroundStd: [number, number, number];
+  referencePersonLabMean: [number, number, number];
+  referencePersonLabStd: [number, number, number];
+  referenceBackgroundLabMean: [number, number, number];
+  referenceBackgroundLabStd: [number, number, number];
   referenceBackgroundColor: [number, number, number];
   replaceBackground: boolean;
   rimIntensity: number;
+  audioReactive: boolean;
+  audioLevel: number;
+  audioBeat: number;
   rimColor: [number, number, number];
 };
 
@@ -35,6 +43,7 @@ uniform float u_backgroundEv;
 uniform float u_warmth;
 uniform float u_contrast;
 uniform float u_isolate;
+uniform float u_labTransfer;
 uniform float u_referenceStrength;
 uniform vec3 u_sourcePersonMean;
 uniform vec3 u_sourcePersonStd;
@@ -44,6 +53,14 @@ uniform vec3 u_referencePersonMean;
 uniform vec3 u_referencePersonStd;
 uniform vec3 u_referenceBackgroundMean;
 uniform vec3 u_referenceBackgroundStd;
+uniform vec3 u_sourcePersonLabMean;
+uniform vec3 u_sourcePersonLabStd;
+uniform vec3 u_sourceBackgroundLabMean;
+uniform vec3 u_sourceBackgroundLabStd;
+uniform vec3 u_referencePersonLabMean;
+uniform vec3 u_referencePersonLabStd;
+uniform vec3 u_referenceBackgroundLabMean;
+uniform vec3 u_referenceBackgroundLabStd;
 uniform vec3 u_referenceBackgroundColor;
 uniform float u_replaceBackground;
 uniform vec2 u_maskTexel;
@@ -73,6 +90,49 @@ vec3 transferLook(vec3 c, vec3 sourceMean, vec3 sourceStd, vec3 targetMean, vec3
   return mix(c, matched, u_referenceStrength);
 }
 
+float labCurve(float value) {
+  return value > .008856 ? pow(value, 1. / 3.) : 7.787 * value + 16. / 116.;
+}
+
+float inverseLabCurve(float value) {
+  float cubed = value * value * value;
+  return cubed > .008856 ? cubed : (value - 16. / 116.) / 7.787;
+}
+
+vec3 rgbToLab(vec3 rgb) {
+  vec3 linearRgb = mix(rgb / 12.92, pow((rgb + .055) / 1.055, vec3(2.4)), step(vec3(.04045), rgb));
+  vec3 xyz = vec3(
+    dot(linearRgb, vec3(.4124564, .3575761, .1804375)) / .95047,
+    dot(linearRgb, vec3(.2126729, .7151522, .072175)),
+    dot(linearRgb, vec3(.0193339, .119192, .9503041)) / 1.08883
+  );
+  float fx = labCurve(xyz.x);
+  float fy = labCurve(xyz.y);
+  float fz = labCurve(xyz.z);
+  return vec3((116. * fy - 16.) / 100., 500. * (fx - fy) / 128., 200. * (fy - fz) / 128.);
+}
+
+vec3 labToRgb(vec3 lab) {
+  float fy = (lab.x * 100. + 16.) / 116.;
+  float fx = fy + lab.y * 128. / 500.;
+  float fz = fy - lab.z * 128. / 200.;
+  vec3 xyz = vec3(inverseLabCurve(fx) * .95047, inverseLabCurve(fy), inverseLabCurve(fz) * 1.08883);
+  vec3 linearRgb = vec3(
+    dot(xyz, vec3(3.2404542, -1.5371385, -.4985314)),
+    dot(xyz, vec3(-.969266, 1.8760108, .041556)),
+    dot(xyz, vec3(.0556434, -.2040259, 1.0572252))
+  );
+  vec3 positive = max(linearRgb, vec3(0.));
+  return clamp(mix(12.92 * positive, 1.055 * pow(positive, vec3(1. / 2.4)) - .055, step(vec3(.0031308), positive)), 0., 1.);
+}
+
+vec3 transferLab(vec3 c, vec3 sourceMean, vec3 sourceStd, vec3 targetMean, vec3 targetStd) {
+  vec3 lab = rgbToLab(c);
+  vec3 matched = (lab - sourceMean) / max(sourceStd, vec3(.025))
+    * clamp(targetStd, vec3(.025), vec3(.65)) + targetMean;
+  return labToRgb(matched);
+}
+
 vec3 screenLight(vec3 base, vec3 light) {
   return 1. - (1. - base) * (1. - clamp(light, 0., 1.));
 }
@@ -93,8 +153,11 @@ void main() {
   // uncertain hair/edge pixels transmit part of the light behind them.
   float matteAlpha = clamp(softMask, 0., 1.);
   float person = mix(1., smoothstep(.12, .88, matteAlpha), u_isolate);
-  vec3 foreground = transferLook(source, u_sourcePersonMean, u_sourcePersonStd, u_referencePersonMean, u_referencePersonStd, 1.);
-  vec3 background = transferLook(source, u_sourceBackgroundMean, u_sourceBackgroundStd, u_referenceBackgroundMean, u_referenceBackgroundStd, 0.);
+  vec3 foregroundRgb = transferLook(source, u_sourcePersonMean, u_sourcePersonStd, u_referencePersonMean, u_referencePersonStd, 1.);
+  vec3 backgroundRgb = transferLook(source, u_sourceBackgroundMean, u_sourceBackgroundStd, u_referenceBackgroundMean, u_referenceBackgroundStd, 0.);
+  float labAmount = u_labTransfer * step(.001, u_referenceStrength);
+  vec3 foreground = mix(foregroundRgb, transferLab(source, u_sourcePersonLabMean, u_sourcePersonLabStd, u_referencePersonLabMean, u_referencePersonLabStd), labAmount);
+  vec3 background = mix(backgroundRgb, transferLab(source, u_sourceBackgroundLabMean, u_sourceBackgroundLabStd, u_referenceBackgroundLabMean, u_referenceBackgroundLabStd), labAmount);
   foreground = grade(foreground, u_autoEv + u_manualEv);
 
   // Approximate a local signed-distance field around the matte boundary. The
@@ -186,6 +249,10 @@ export class RelightRenderer {
   sourcePersonStd: [number, number, number] = [.22, .22, .22];
   sourceBackgroundMean: [number, number, number] = [.5, .5, .5];
   sourceBackgroundStd: [number, number, number] = [.22, .22, .22];
+  sourcePersonLabMean: [number, number, number] = [.5, 0, 0];
+  sourcePersonLabStd: [number, number, number] = [.22, .22, .22];
+  sourceBackgroundLabMean: [number, number, number] = [.5, 0, 0];
+  sourceBackgroundLabStd: [number, number, number] = [.22, .22, .22];
   viewZoom = 1;
   viewCenter: [number, number] = [.5, .5];
   private framingInitialized = false;
@@ -237,7 +304,7 @@ export class RelightRenderer {
     return matte;
   }
 
-  render(source: HTMLVideoElement | HTMLCanvasElement, look: Look) {
+  render(source: HTMLVideoElement | HTMLCanvasElement, look: Look, uploadSource = true) {
     const isVideo = source instanceof HTMLVideoElement;
     if (isVideo && source.readyState < 2) return;
     const width = isVideo ? source.videoWidth : source.width;
@@ -252,15 +319,16 @@ export class RelightRenderer {
     gl.useProgram(this.program);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.videoTexture);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+    if (uploadSource) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, this.maskTexture);
-    gl.uniform1f(gl.getUniformLocation(this.program, "u_autoEv"), look.autoAdjust ? this.autoEv : 0);
+    gl.uniform1f(gl.getUniformLocation(this.program, "u_autoEv"), look.autoAdjust && !look.labTransfer ? this.autoEv : 0);
     gl.uniform1f(gl.getUniformLocation(this.program, "u_manualEv"), look.autoAdjust ? look.manualEv : 0);
     gl.uniform1f(gl.getUniformLocation(this.program, "u_backgroundEv"), look.backgroundEv);
     gl.uniform1f(gl.getUniformLocation(this.program, "u_warmth"), look.autoAdjust ? look.warmth : 0);
     gl.uniform1f(gl.getUniformLocation(this.program, "u_contrast"), look.autoAdjust ? look.contrast : 1);
     gl.uniform1f(gl.getUniformLocation(this.program, "u_isolate"), look.isolate ? 1 : 0);
+    gl.uniform1f(gl.getUniformLocation(this.program, "u_labTransfer"), look.labTransfer && look.autoAdjust ? 1 : 0);
     gl.uniform1f(gl.getUniformLocation(this.program, "u_referenceStrength"), look.autoAdjust ? look.referenceStrength : 0);
     gl.uniform3fv(gl.getUniformLocation(this.program, "u_sourcePersonMean"), this.sourcePersonMean);
     gl.uniform3fv(gl.getUniformLocation(this.program, "u_sourcePersonStd"), this.sourcePersonStd);
@@ -270,10 +338,19 @@ export class RelightRenderer {
     gl.uniform3fv(gl.getUniformLocation(this.program, "u_referencePersonStd"), look.referencePersonStd);
     gl.uniform3fv(gl.getUniformLocation(this.program, "u_referenceBackgroundMean"), look.referenceBackgroundMean);
     gl.uniform3fv(gl.getUniformLocation(this.program, "u_referenceBackgroundStd"), look.referenceBackgroundStd);
+    gl.uniform3fv(gl.getUniformLocation(this.program, "u_sourcePersonLabMean"), this.sourcePersonLabMean);
+    gl.uniform3fv(gl.getUniformLocation(this.program, "u_sourcePersonLabStd"), this.sourcePersonLabStd);
+    gl.uniform3fv(gl.getUniformLocation(this.program, "u_sourceBackgroundLabMean"), this.sourceBackgroundLabMean);
+    gl.uniform3fv(gl.getUniformLocation(this.program, "u_sourceBackgroundLabStd"), this.sourceBackgroundLabStd);
+    gl.uniform3fv(gl.getUniformLocation(this.program, "u_referencePersonLabMean"), look.referencePersonLabMean);
+    gl.uniform3fv(gl.getUniformLocation(this.program, "u_referencePersonLabStd"), look.referencePersonLabStd);
+    gl.uniform3fv(gl.getUniformLocation(this.program, "u_referenceBackgroundLabMean"), look.referenceBackgroundLabMean);
+    gl.uniform3fv(gl.getUniformLocation(this.program, "u_referenceBackgroundLabStd"), look.referenceBackgroundLabStd);
     gl.uniform3fv(gl.getUniformLocation(this.program, "u_referenceBackgroundColor"), look.referenceBackgroundColor);
     gl.uniform1f(gl.getUniformLocation(this.program, "u_replaceBackground"), look.replaceBackground && look.referenceStrength > 0 ? 1 : 0);
     gl.uniform2f(gl.getUniformLocation(this.program, "u_maskTexel"), 1 / this.maskWidth, 1 / this.maskHeight);
-    gl.uniform1f(gl.getUniformLocation(this.program, "u_rimIntensity"), look.rimIntensity);
+    const audioGain = look.audioReactive ? .6 + look.audioLevel * .75 + look.audioBeat * .85 : 1;
+    gl.uniform1f(gl.getUniformLocation(this.program, "u_rimIntensity"), Math.min(1, look.rimIntensity * audioGain));
     gl.uniform3fv(gl.getUniformLocation(this.program, "u_rimColor"), look.rimColor);
     gl.uniform1f(gl.getUniformLocation(this.program, "u_viewZoom"), this.viewZoom);
     gl.uniform2fv(gl.getUniformLocation(this.program, "u_viewCenter"), this.viewCenter);

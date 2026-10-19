@@ -13,17 +13,34 @@ const state: Look = {
   warmth: 0,
   contrast: 1,
   isolate: true,
+  labTransfer: true,
   referenceStrength: 0,
   referencePersonMean: [.5, .5, .5],
   referencePersonStd: [.22, .22, .22],
   referenceBackgroundMean: [.5, .5, .5],
   referenceBackgroundStd: [.22, .22, .22],
+  referencePersonLabMean: [.5, 0, 0],
+  referencePersonLabStd: [.22, .22, .22],
+  referenceBackgroundLabMean: [.5, 0, 0],
+  referenceBackgroundLabStd: [.22, .22, .22],
   referenceBackgroundColor: [.06, .06, .28],
   replaceBackground: true,
   rimIntensity: .4,
+  audioReactive: false,
+  audioLevel: 0,
+  audioBeat: 0,
   rimColor: [.56, .86, 1]
 };
 let showMask = false;
+
+type MusicTrack = {
+  trackId: number;
+  trackName: string;
+  artistName: string;
+  previewUrl?: string;
+  artworkUrl100?: string;
+  trackViewUrl?: string;
+};
 
 type StoredVideo = {
   id: string;
@@ -111,11 +128,6 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
       <div class="brand"><span class="brand-mark">◒</span> Relight Lab</div>
       <div class="status"><span class="status-dot" id="model-dot"></span><span id="model-status">Model loads when isolation is enabled</span></div>
     </header>
-    <section class="hero">
-      <div class="eyebrow">Browser-native lighting</div>
-      <h1>One room.<br>Every camera.</h1>
-      <p>Normalize people into a shared lighting environment locally in your browser. No frames leave this device.</p>
-    </section>
     <section class="controls">
       <div class="actions">
         <button class="action" id="webcam">Use webcam</button>
@@ -129,18 +141,38 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
       <label class="toggle"><input id="isolate" type="checkbox" checked><span class="switch"></span>Isolate people</label>
       <label class="toggle"><input id="show-mask" type="checkbox"><span class="switch"></span>Show masks</label>
       <label class="toggle"><input id="reference-background" type="checkbox" checked><span class="switch"></span>Reference background</label>
+      <label class="toggle" title="Reinhard mean and standard-deviation transfer in CIELAB"><input id="lab-transfer" type="checkbox" checked><span class="switch"></span>Reinhard LAB</label>
       <div class="shape-switch" role="group" aria-label="Video tile shape">
         <span>Tiles</span>
         <button type="button" data-shape="square" aria-pressed="false">Square</button>
         <button class="active" type="button" data-shape="portrait" aria-pressed="true">Portrait</button>
       </div>
+      <div class="backlight-compact" title="Music drives this slider while playing; drag it for temporary manual control">
+        <label for="rim-intensity">Light</label>
+        <input id="rim-intensity" type="range" min="0" max="100" value="40" step="1">
+        <input id="rim-color" type="color" value="#8edcff" aria-label="Backlight color">
+        <output id="rim-color-output" for="rim-color" hidden>#8edcff</output>
+      </div>
       <span class="hint">MediaPipe multiclass · 256 × 256 · videos survive reload</span>
     </div>
-    <section class="rim-panel">
-      <div class="rim-copy"><strong>Fake backlight</strong><small>Radial light behind each subject</small></div>
-      <div class="rim-sliders">
-        <label><span>Intensity <output id="rim-intensity-output">40%</output></span><input id="rim-intensity" type="range" min="0" max="100" value="40" step="1"></label>
-        <label class="color-control"><span>Light color <output id="rim-color-output">#8edcff</output></span><input id="rim-color" type="color" value="#8edcff" aria-label="Backlight color"></label>
+    <section class="music-panel">
+      <div class="music-copy">
+        <strong>Music preview</strong>
+        <small>Search and stream 30-second previews</small>
+      </div>
+      <div class="music-controls">
+        <form class="music-search" id="music-search-form">
+          <input id="music-search-input" type="search" placeholder="Search Apple Music" aria-label="Search Apple Music" autocomplete="off">
+          <button type="submit">Search</button>
+        </form>
+        <div class="music-results" id="music-results" hidden></div>
+        <div class="now-playing" id="now-playing" hidden>
+          <img id="music-artwork" alt="">
+          <button class="preview-toggle" id="preview-toggle" type="button" aria-label="Pause preview">Ⅱ</button>
+          <div class="track-copy"><strong id="track-name"></strong><span id="track-artist"></span></div>
+          <a id="track-link" target="_blank" rel="noopener">Open in Apple Music ↗</a>
+        </div>
+        <div class="music-footnote"><span id="music-status">Enter a song or artist.</span><span>Preview provided courtesy of iTunes</span></div>
       </div>
     </section>
     <section class="reference-strip drop-target" id="reference-strip" title="Drop a reference image here" hidden>
@@ -275,6 +307,45 @@ function colorStats(pixels: Uint8ClampedArray, mask: Uint8Array, person: boolean
   return { mean, std, luma: mean[0] * .2126 + mean[1] * .7152 + mean[2] * .0722, count };
 }
 
+function rgbPixelToLab(red: number, green: number, blue: number): [number, number, number] {
+  const toLinear = (value: number) => {
+    const channel = value / 255;
+    return channel <= .04045 ? channel / 12.92 : Math.pow((channel + .055) / 1.055, 2.4);
+  };
+  const r = toLinear(red);
+  const g = toLinear(green);
+  const b = toLinear(blue);
+  const x = (r * .4124564 + g * .3575761 + b * .1804375) / .95047;
+  const y = r * .2126729 + g * .7151522 + b * .072175;
+  const z = (r * .0193339 + g * .119192 + b * .9503041) / 1.08883;
+  const curve = (value: number) => value > .008856 ? Math.cbrt(value) : 7.787 * value + 16 / 116;
+  const fx = curve(x);
+  const fy = curve(y);
+  const fz = curve(z);
+  return [(116 * fy - 16) / 100, 500 * (fx - fy) / 128, 200 * (fy - fz) / 128];
+}
+
+function labColorStats(pixels: Uint8ClampedArray, mask: Uint8Array, person: boolean): ColorStats {
+  const sum = [0, 0, 0];
+  const square = [0, 0, 0];
+  let count = 0;
+  const pixelCount = Math.min(mask.length, pixels.length / 4);
+  for (let i = 0; i < pixelCount; i += 2) {
+    if ((mask[i] >= 128) !== person) continue;
+    const p = i * 4;
+    const lab = rgbPixelToLab(pixels[p], pixels[p + 1], pixels[p + 2]);
+    for (let c = 0; c < 3; c++) {
+      sum[c] += lab[c];
+      square[c] += lab[c] * lab[c];
+    }
+    count++;
+  }
+  if (!count) return { mean: [.5, 0, 0], std: [.22, .22, .22], luma: .5, count: 0 };
+  const mean = sum.map((value) => value / count) as [number, number, number];
+  const std = square.map((value, c) => Math.sqrt(Math.max(.000625, value / count - mean[c] * mean[c]))) as [number, number, number];
+  return { mean, std, luma: mean[0], count };
+}
+
 function mixStats(current: [number, number, number], next: [number, number, number], amount: number) {
   for (let i = 0; i < 3; i++) current[i] += (next[i] - current[i]) * amount;
 }
@@ -372,6 +443,8 @@ class ReferenceAnalyzer {
       const pixels = sampleCtx.getImageData(0, 0, sample.width, sample.height).data;
       const person = colorStats(pixels, matte.alpha, true);
       const background = colorStats(pixels, matte.alpha, false);
+      const personLab = labColorStats(pixels, matte.alpha, true);
+      const backgroundLab = labColorStats(pixels, matte.alpha, false);
       const backgroundColor = dominantBackgroundColor(pixels, matte.alpha);
       if (person.count < 100) throw new Error("No clear person was found in the reference");
 
@@ -379,6 +452,10 @@ class ReferenceAnalyzer {
       state.referencePersonStd = person.std;
       state.referenceBackgroundMean = background.mean;
       state.referenceBackgroundStd = background.std;
+      state.referencePersonLabMean = personLab.mean;
+      state.referencePersonLabStd = personLab.std;
+      state.referenceBackgroundLabMean = backgroundLab.mean;
+      state.referenceBackgroundLabStd = backgroundLab.std;
       state.referenceBackgroundColor = backgroundColor;
       state.targetLuma = Math.max(.3, Math.min(.75, person.luma));
       state.referenceStrength = .45;
@@ -407,7 +484,12 @@ class VideoSource {
   private analysisCtx = this.analysisCanvas.getContext("2d", { willReadFrequently: true })!;
   private segmentationFrame = document.createElement("canvas");
   private segmentationCtx = this.segmentationFrame.getContext("2d", { alpha: false })!;
+  private pendingFrame = document.createElement("canvas");
+  private pendingCtx = this.pendingFrame.getContext("2d", { alpha: false })!;
+  private pairedFrame = document.createElement("canvas");
+  private pairedCtx = this.pairedFrame.getContext("2d", { alpha: false })!;
   private hasPairedFrame = false;
+  private sourceTextureDirty = true;
 
   constructor(file: File | MediaStream, name: string, private storedId?: string) {
     this.video.className = "source-video";
@@ -440,13 +522,13 @@ class VideoSource {
   private tick = () => {
     if (!this.active) return;
     if (state.isolate) {
-      // Once segmentation starts, keep rendering the last exact frame/mask pair.
-      // Rendering the advancing <video> here would make the mask visibly lag.
       if (!this.hasPairedFrame) this.captureSegmentationFrame();
-      this.renderer.render(this.segmentationFrame, state);
+      const displayFrame = this.hasPairedFrame ? this.pairedFrame : this.pendingFrame;
+      this.renderer.render(displayFrame, state, this.sourceTextureDirty);
+      this.sourceTextureDirty = false;
     } else {
       this.captureSegmentationFrame();
-      this.renderer.render(this.segmentationFrame, state);
+      this.renderer.render(this.pendingFrame, state, true);
     }
     if (performance.now() - this.lastAnalysis > 120) {
       this.lastAnalysis = performance.now();
@@ -458,47 +540,75 @@ class VideoSource {
 
   captureSegmentationFrame() {
     if (this.video.readyState < 2 || !this.video.videoWidth) return undefined;
+    const renderSize = Math.min(1280, Math.max(512, Math.max(this.video.videoWidth, this.video.videoHeight)));
+    if (this.pendingFrame.width !== renderSize || this.pendingFrame.height !== renderSize) {
+      this.pendingFrame.width = renderSize;
+      this.pendingFrame.height = renderSize;
+      this.pendingCtx.imageSmoothingEnabled = true;
+      this.pendingCtx.imageSmoothingQuality = "high";
+    }
     if (this.segmentationFrame.width !== 256 || this.segmentationFrame.height !== 256) {
       this.segmentationFrame.width = 256;
       this.segmentationFrame.height = 256;
+      this.segmentationCtx.imageSmoothingEnabled = true;
+      this.segmentationCtx.imageSmoothingQuality = "high";
     }
     const [red, green, blue] = state.referenceBackgroundColor.map((channel) => Math.round(channel * 255));
-    this.segmentationCtx.fillStyle = `rgb(${red} ${green} ${blue})`;
-    this.segmentationCtx.fillRect(0, 0, 256, 256);
-    const scale = Math.min(256 / this.video.videoWidth, 256 / this.video.videoHeight);
+    this.pendingCtx.fillStyle = `rgb(${red} ${green} ${blue})`;
+    this.pendingCtx.fillRect(0, 0, renderSize, renderSize);
+    const scale = Math.min(renderSize / this.video.videoWidth, renderSize / this.video.videoHeight);
     const width = Math.round(this.video.videoWidth * scale);
     const height = Math.round(this.video.videoHeight * scale);
-    const x = Math.floor((256 - width) / 2);
-    const y = Math.floor((256 - height) / 2);
-    this.segmentationCtx.drawImage(this.video, x, y, width, height);
+    const x = Math.floor((renderSize - width) / 2);
+    const y = Math.floor((renderSize - height) / 2);
+    // Draw the decoded video once, then derive the model input from this exact
+    // high-resolution snapshot so the display frame and matte stay paired.
+    this.pendingCtx.drawImage(this.video, x, y, width, height);
+    this.segmentationCtx.drawImage(this.pendingFrame, 0, 0, 256, 256);
+    if (!this.hasPairedFrame) this.sourceTextureDirty = true;
     return this.segmentationFrame;
   }
 
   acceptSegmentation(result: ImageSegmenterResult) {
     const matte = extractPersonMatte(result);
     if (!matte) return;
+    if (this.pairedFrame.width !== this.pendingFrame.width || this.pairedFrame.height !== this.pendingFrame.height) {
+      this.pairedFrame.width = this.pendingFrame.width;
+      this.pairedFrame.height = this.pendingFrame.height;
+      this.pairedCtx.imageSmoothingEnabled = true;
+      this.pairedCtx.imageSmoothingQuality = "high";
+    }
+    this.pairedCtx.drawImage(this.pendingFrame, 0, 0);
     const alpha = this.renderer.updateMask(matte.alpha, matte.width, matte.height);
     this.renderer.updateFraming(alpha, matte.width, matte.height);
     this.hasPairedFrame = true;
+    this.sourceTextureDirty = true;
     this.updateMaskPreview(alpha, matte.width, matte.height);
     this.updateExposure(alpha, matte.width, matte.height);
-    this.renderer.render(this.segmentationFrame, state);
+    this.renderer.render(this.pairedFrame, state, true);
+    this.sourceTextureDirty = false;
   }
 
   private updateExposure(mask: Uint8Array, width: number, height: number) {
     this.analysisCanvas.width = width;
     this.analysisCanvas.height = height;
-    this.analysisCtx.drawImage(this.segmentationFrame, 0, 0, width, height);
+    this.analysisCtx.drawImage(this.pairedFrame, 0, 0, width, height);
     const pixels = this.analysisCtx.getImageData(0, 0, width, height).data;
     const personColor = colorStats(pixels, mask, true);
     const backgroundColor = colorStats(pixels, mask, false);
+    const personLab = labColorStats(pixels, mask, true);
+    const backgroundLab = labColorStats(pixels, mask, false);
     if (personColor.count) {
       mixStats(this.renderer.sourcePersonMean, personColor.mean, .12);
       mixStats(this.renderer.sourcePersonStd, personColor.std, .12);
+      mixStats(this.renderer.sourcePersonLabMean, personLab.mean, .12);
+      mixStats(this.renderer.sourcePersonLabStd, personLab.std, .12);
     }
     if (backgroundColor.count) {
       mixStats(this.renderer.sourceBackgroundMean, backgroundColor.mean, .12);
       mixStats(this.renderer.sourceBackgroundStd, backgroundColor.std, .12);
+      mixStats(this.renderer.sourceBackgroundLabMean, backgroundLab.mean, .12);
+      mixStats(this.renderer.sourceBackgroundLabStd, backgroundLab.std, .12);
     }
     let sum = 0;
     let count = 0;
@@ -524,8 +634,11 @@ class VideoSource {
     const pixels = this.analysisCtx.getImageData(0, 0, width, height).data;
     const wholeFrameMask = new Uint8Array(width * height).fill(255);
     const frameColor = colorStats(pixels, wholeFrameMask, true);
+    const frameLab = labColorStats(pixels, wholeFrameMask, true);
     mixStats(this.renderer.sourcePersonMean, frameColor.mean, .12);
     mixStats(this.renderer.sourcePersonStd, frameColor.std, .12);
+    mixStats(this.renderer.sourcePersonLabMean, frameLab.mean, .12);
+    mixStats(this.renderer.sourcePersonLabStd, frameLab.std, .12);
     let sum = 0;
     let count = 0;
     for (let p = 0; p < pixels.length; p += 8) {
@@ -599,6 +712,271 @@ async function restoreSessionVideos() {
   }
 }
 
+const previewAudio = new Audio();
+previewAudio.crossOrigin = "anonymous";
+previewAudio.preload = "none";
+previewAudio.loop = true;
+let currentTrack: MusicTrack | undefined;
+let audioContext: AudioContext | undefined;
+let audioAnalyser: AnalyserNode | undefined;
+let audioSamples: Uint8Array<ArrayBuffer> | undefined;
+let frequencySamples: Uint8Array<ArrayBuffer> | undefined;
+let previousSpectrum: Float32Array<ArrayBuffer> | undefined;
+const onsetHistory: number[] = [];
+let lastBeatAt = -Infinity;
+let meterAnimation = 0;
+let rimSliderHeld = false;
+
+function searchMusic(term: string) {
+  return new Promise<MusicTrack[]>((resolve, reject) => {
+    const callbackName = `__relightMusic${Date.now()}${Math.floor(Math.random() * 1000)}`;
+    const script = document.createElement("script");
+    const globals = window as unknown as Record<string, unknown>;
+    const localeRegion = navigator.language.match(/-([A-Za-z]{2})$/)?.[1]?.toUpperCase() ?? "US";
+    let settled = false;
+    const cleanup = () => {
+      delete globals[callbackName];
+      script.remove();
+    };
+    const timer = window.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new Error("Music search timed out"));
+    }, 10000);
+    globals[callbackName] = (payload: { results?: MusicTrack[] }) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      cleanup();
+      resolve((payload.results ?? []).filter((track) => Boolean(track.previewUrl)));
+    };
+    script.onerror = () => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      cleanup();
+      reject(new Error("Music search could not be reached"));
+    };
+    const params = new URLSearchParams({
+      term,
+      media: "music",
+      entity: "song",
+      limit: "8",
+      country: localeRegion,
+      callback: callbackName
+    });
+    script.src = `https://itunes.apple.com/search?${params}`;
+    document.head.append(script);
+  });
+}
+
+function artworkUrl(track: MusicTrack) {
+  return (track.artworkUrl100 ?? "").replace("100x100bb", "160x160bb").replace(/^http:/, "https:");
+}
+
+function renderMusicResults(tracks: MusicTrack[]) {
+  const results = document.querySelector<HTMLElement>("#music-results")!;
+  results.replaceChildren();
+  if (!tracks.length) {
+    const empty = document.createElement("div");
+    empty.className = "music-result";
+    empty.textContent = "No playable previews found.";
+    results.append(empty);
+  }
+  for (const track of tracks) {
+    const button = document.createElement("button");
+    button.className = "music-result";
+    button.type = "button";
+    const art = document.createElement("img");
+    art.src = artworkUrl(track);
+    art.alt = "";
+    const copy = document.createElement("span");
+    copy.className = "track-copy";
+    const title = document.createElement("strong");
+    title.textContent = track.trackName;
+    const artist = document.createElement("span");
+    artist.textContent = track.artistName;
+    copy.append(title, artist);
+    const play = document.createElement("span");
+    play.textContent = "▶";
+    button.append(art, copy, play);
+    button.addEventListener("click", () => void playTrack(track));
+    results.append(button);
+  }
+  results.hidden = false;
+}
+
+function ensureAudioGraph() {
+  if (audioAnalyser) return;
+  audioContext = new AudioContext();
+  const source = audioContext.createMediaElementSource(previewAudio);
+  audioAnalyser = audioContext.createAnalyser();
+  audioAnalyser.fftSize = 2048;
+  audioAnalyser.smoothingTimeConstant = .45;
+  audioSamples = new Uint8Array(audioAnalyser.fftSize);
+  frequencySamples = new Uint8Array(audioAnalyser.frequencyBinCount);
+  previousSpectrum = new Float32Array(audioAnalyser.frequencyBinCount);
+  source.connect(audioAnalyser);
+  audioAnalyser.connect(audioContext.destination);
+}
+
+function detectBeat(now: number) {
+  if (!audioAnalyser || !audioContext || !frequencySamples || !previousSpectrum) return false;
+  audioAnalyser.getByteFrequencyData(frequencySamples);
+  const binHz = audioContext.sampleRate / audioAnalyser.fftSize;
+  const bassStart = Math.max(1, Math.floor(45 / binHz));
+  const bassEnd = Math.min(frequencySamples.length - 1, Math.ceil(200 / binHz));
+  // Keep the onset detector in the rhythmic low/mid band. Extending through
+  // the whole spectrum makes hi-hats look like beats and produces flicker.
+  const fluxEnd = Math.min(frequencySamples.length - 1, Math.ceil(1200 / binHz));
+  let bass = 0;
+  let bassBins = 0;
+  let flux = 0;
+  let fluxWeight = 0;
+  for (let bin = 1; bin <= fluxEnd; bin++) {
+    const value = frequencySamples[bin] / 255;
+    if (bin >= bassStart && bin <= bassEnd) {
+      bass += value;
+      bassBins++;
+    }
+    const increase = Math.max(0, value - previousSpectrum[bin]);
+    const weight = bin <= bassEnd ? 1.65 : 1;
+    flux += increase * weight;
+    fluxWeight += weight;
+    previousSpectrum[bin] = value;
+  }
+  bass /= Math.max(1, bassBins);
+  const onset = flux / Math.max(1, fluxWeight) * (.6 + bass * 1.4);
+  let mean = 0;
+  for (const value of onsetHistory) mean += value;
+  mean /= Math.max(1, onsetHistory.length);
+  let variance = 0;
+  for (const value of onsetHistory) variance += (value - mean) ** 2;
+  const deviation = Math.sqrt(variance / Math.max(1, onsetHistory.length));
+  const threshold = mean + Math.max(.0018, deviation * 1.65);
+  const beat = onsetHistory.length >= 18 && onset > Math.max(.005, threshold) && bass > .14 && now - lastBeatAt > 220;
+  onsetHistory.push(onset);
+  if (onsetHistory.length > 72) onsetHistory.shift();
+  if (beat) lastBeatAt = now;
+  return beat;
+}
+
+function updateMeter() {
+  let target = 0;
+  if (!previewAudio.paused && audioAnalyser && audioSamples) {
+    audioAnalyser.getByteTimeDomainData(audioSamples);
+    let sum = 0;
+    for (const sample of audioSamples) {
+      const centered = (sample - 128) / 128;
+      sum += centered * centered;
+    }
+    const rms = Math.sqrt(sum / audioSamples.length);
+    target = Math.max(0, Math.min(1, (rms - .022) * 2.8));
+    if (detectBeat(performance.now())) {
+      state.audioBeat = 1;
+    }
+  }
+  const speed = target > state.audioLevel ? .34 : .09;
+  state.audioLevel += (target - state.audioLevel) * speed;
+  state.audioBeat *= .82;
+  if (state.audioLevel < .002) state.audioLevel = 0;
+  if (state.audioBeat < .002) state.audioBeat = 0;
+  if (!rimSliderHeld) {
+    const gain = state.audioReactive ? .6 + state.audioLevel * .75 + state.audioBeat * .85 : 1;
+    const displayedIntensity = Math.min(1, state.rimIntensity * gain);
+    const slider = document.querySelector<HTMLInputElement>("#rim-intensity")!;
+    slider.value = String(Math.round(displayedIntensity * 100));
+    slider.setAttribute("aria-valuetext", state.audioReactive ? "Music-driven light intensity" : "Light intensity");
+  }
+  if (!previewAudio.paused || state.audioLevel > 0 || state.audioBeat > 0) meterAnimation = requestAnimationFrame(updateMeter);
+  else meterAnimation = 0;
+}
+
+function startMeter() {
+  if (!meterAnimation) meterAnimation = requestAnimationFrame(updateMeter);
+}
+
+async function playTrack(track: MusicTrack) {
+  if (!track.previewUrl) return;
+  const status = document.querySelector<HTMLElement>("#music-status")!;
+  try {
+    ensureAudioGraph();
+    await audioContext!.resume();
+    if (currentTrack?.trackId !== track.trackId) {
+      currentTrack = track;
+      onsetHistory.length = 0;
+      previousSpectrum?.fill(0);
+      lastBeatAt = -Infinity;
+      previewAudio.src = track.previewUrl.replace(/^http:/, "https:");
+      document.querySelector<HTMLImageElement>("#music-artwork")!.src = artworkUrl(track);
+      document.querySelector<HTMLElement>("#track-name")!.textContent = track.trackName;
+      document.querySelector<HTMLElement>("#track-artist")!.textContent = track.artistName;
+      const link = document.querySelector<HTMLAnchorElement>("#track-link")!;
+      link.href = track.trackViewUrl ?? "https://music.apple.com/";
+    }
+    await previewAudio.play();
+    state.audioReactive = !rimSliderHeld;
+    document.querySelector<HTMLElement>("#now-playing")!.hidden = false;
+    document.querySelector<HTMLElement>("#music-results")!.hidden = true;
+    document.querySelector<HTMLButtonElement>("#preview-toggle")!.textContent = "Ⅱ";
+    document.querySelector<HTMLButtonElement>("#preview-toggle")!.setAttribute("aria-label", "Pause preview");
+    status.textContent = "Playing preview";
+    startMeter();
+  } catch (error) {
+    state.audioReactive = false;
+    console.error(error);
+    status.textContent = "This preview could not be played.";
+  }
+}
+
+document.querySelector<HTMLFormElement>("#music-search-form")!.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const input = document.querySelector<HTMLInputElement>("#music-search-input")!;
+  const term = input.value.trim();
+  if (!term) return;
+  const status = document.querySelector<HTMLElement>("#music-status")!;
+  status.textContent = "Searching…";
+  document.querySelector<HTMLElement>("#music-results")!.hidden = true;
+  try {
+    const tracks = await searchMusic(term);
+    renderMusicResults(tracks);
+    status.textContent = tracks.length ? `${tracks.length} previews found` : "No playable previews found.";
+  } catch (error) {
+    console.error(error);
+    status.textContent = "Search is temporarily unavailable.";
+  }
+});
+
+document.querySelector<HTMLButtonElement>("#preview-toggle")!.addEventListener("click", async () => {
+  const button = document.querySelector<HTMLButtonElement>("#preview-toggle")!;
+  if (previewAudio.paused) {
+    await audioContext?.resume();
+    await previewAudio.play();
+    state.audioReactive = !rimSliderHeld;
+    button.textContent = "Ⅱ";
+    button.setAttribute("aria-label", "Pause preview");
+    document.querySelector<HTMLElement>("#music-status")!.textContent = "Playing preview";
+    startMeter();
+  } else {
+    previewAudio.pause();
+    state.audioReactive = false;
+    button.textContent = "▶";
+    button.setAttribute("aria-label", "Play preview");
+    document.querySelector<HTMLElement>("#music-status")!.textContent = "Preview paused";
+    startMeter();
+  }
+});
+
+previewAudio.addEventListener("ended", () => {
+  state.audioReactive = false;
+  const button = document.querySelector<HTMLButtonElement>("#preview-toggle")!;
+  button.textContent = "▶";
+  button.setAttribute("aria-label", "Play preview");
+  document.querySelector<HTMLElement>("#music-status")!.textContent = "Preview ended";
+  startMeter();
+});
+
 document.querySelector<HTMLInputElement>("#auto-adjust")!.addEventListener("change", (event) => {
   state.autoAdjust = (event.target as HTMLInputElement).checked;
 });
@@ -613,6 +991,9 @@ document.querySelector<HTMLInputElement>("#show-mask")!.addEventListener("change
 document.querySelector<HTMLInputElement>("#reference-background")!.addEventListener("change", (event) => {
   state.replaceBackground = (event.target as HTMLInputElement).checked;
 });
+document.querySelector<HTMLInputElement>("#lab-transfer")!.addEventListener("change", (event) => {
+  state.labTransfer = (event.target as HTMLInputElement).checked;
+});
 document.querySelectorAll<HTMLButtonElement>("[data-shape]").forEach((button) => {
   button.addEventListener("click", () => {
     const shape = button.dataset.shape === "portrait" ? "portrait" : "square";
@@ -624,11 +1005,29 @@ document.querySelectorAll<HTMLButtonElement>("[data-shape]").forEach((button) =>
     });
   });
 });
-document.querySelector<HTMLInputElement>("#rim-intensity")!.addEventListener("input", (event) => {
-  const value = Number((event.target as HTMLInputElement).value);
-  state.rimIntensity = value / 100;
-  document.querySelector<HTMLOutputElement>("#rim-intensity-output")!.value = `${value}%`;
+const rimSlider = document.querySelector<HTMLInputElement>("#rim-intensity")!;
+const beginManualRimControl = () => {
+  rimSliderHeld = true;
+  state.audioReactive = false;
+};
+const releaseManualRimControl = () => {
+  if (!rimSliderHeld) return;
+  rimSliderHeld = false;
+  state.audioReactive = !previewAudio.paused;
+  startMeter();
+};
+rimSlider.addEventListener("pointerdown", beginManualRimControl);
+rimSlider.addEventListener("keydown", (event) => {
+  if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"].includes(event.key)) beginManualRimControl();
 });
+rimSlider.addEventListener("input", (event) => {
+  beginManualRimControl();
+  state.rimIntensity = Number((event.target as HTMLInputElement).value) / 100;
+});
+rimSlider.addEventListener("keyup", releaseManualRimControl);
+rimSlider.addEventListener("blur", releaseManualRimControl);
+window.addEventListener("pointerup", releaseManualRimControl);
+window.addEventListener("pointercancel", releaseManualRimControl);
 document.querySelector<HTMLInputElement>("#rim-color")!.addEventListener("input", (event) => {
   const value = (event.target as HTMLInputElement).value;
   state.rimColor = hexToColor(value);
