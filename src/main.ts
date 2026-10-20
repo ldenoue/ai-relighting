@@ -1,5 +1,5 @@
 import { FilesetResolver, ImageSegmenter, type ImageSegmenterResult } from "@mediapipe/tasks-vision";
-import { RelightRenderer, type Look } from "./renderer";
+import { RelightRenderer, type Look, type UpscaleMethod } from "./renderer";
 import "./style.css";
 
 const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite";
@@ -26,20 +26,21 @@ const state: Look = {
   referenceBackgroundColor: [.06, .06, .28],
   replaceBackground: true,
   rimIntensity: .4,
+  showLight: true,
+  lightPosition: [.5, .35],
   audioReactive: false,
   audioLevel: 0,
   audioBeat: 0,
-  rimColor: [.56, .86, 1]
+  rimColor: [.56, .86, 1],
+  upscaleMethod: "fsr1",
+  rcasEnabled: true
 };
-let showMask = false;
 
 type MusicTrack = {
   trackId: number;
   trackName: string;
   artistName: string;
   previewUrl?: string;
-  artworkUrl100?: string;
-  trackViewUrl?: string;
 };
 
 type StoredVideo = {
@@ -126,66 +127,63 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
   <main class="app-shell">
     <header class="topbar">
       <div class="brand"><span class="brand-mark">◒</span> Relight Lab</div>
-      <div class="status"><span class="status-dot" id="model-dot"></span><span id="model-status">Model loads when isolation is enabled</span></div>
-    </header>
-    <section class="controls">
-      <div class="actions">
-        <button class="action" id="webcam">Use webcam</button>
-        <button class="action drop-target" id="reference" title="Choose or drop a reference image">Ref image</button>
-        <input id="file-input" type="file" accept="video/*" multiple hidden />
-        <input id="reference-input" type="file" accept="image/*" hidden />
+      <div class="music-search-shell">
+        <form class="music-search" id="music-search-form">
+          <input id="music-search-input" type="search" placeholder="Search Apple Music" aria-label="Search Apple Music" autocomplete="off">
+          <button class="music-submit" type="submit">Search</button>
+          <button class="music-stop" id="music-stop" type="button" title="Stop music" aria-label="Stop music" hidden>×</button>
+        </form>
+        <div class="music-results" id="music-results" hidden></div>
       </div>
-    </section>
+    </header>
+    <input id="file-input" type="file" accept="video/*" multiple hidden />
+    <input id="reference-input" type="file" accept="image/*" hidden />
     <div class="toggle-row">
       <label class="toggle"><input id="auto-adjust" type="checkbox" checked><span class="switch"></span>Auto adjustments</label>
       <label class="toggle"><input id="isolate" type="checkbox" checked><span class="switch"></span>Isolate people</label>
-      <label class="toggle"><input id="show-mask" type="checkbox"><span class="switch"></span>Show masks</label>
       <label class="toggle"><input id="reference-background" type="checkbox" checked><span class="switch"></span>Reference background</label>
-      <label class="toggle" title="Reinhard mean and standard-deviation transfer in CIELAB"><input id="lab-transfer" type="checkbox" checked><span class="switch"></span>Reinhard LAB</label>
+      <label class="toggle" title="Hide the visible halo while keeping its illumination on the subject"><input id="show-light" type="checkbox" checked><span class="switch"></span>Visible light</label>
+      <label class="toggle" title="Apply AMD RCAS sharpening after the selected upscaler"><input id="rcas" type="checkbox" checked><span class="switch"></span>RCAS</label>
       <div class="shape-switch" role="group" aria-label="Video tile shape">
         <span>Tiles</span>
         <button type="button" data-shape="square" aria-pressed="false">Square</button>
         <button class="active" type="button" data-shape="portrait" aria-pressed="true">Portrait</button>
       </div>
+      <label class="upscale-control" for="upscale-method">
+        <span>Upscale</span>
+        <select id="upscale-method">
+          <option value="bilinear">Bilinear</option>
+          <option value="lanczos2">Lanczos2</option>
+          <option value="fsr1" selected>FSR 1.0</option>
+          <option value="anime4k">Anime4K Original</option>
+          <option value="websr">WebSR CNN-S · Real Life</option>
+          <option value="fsrcnn">FSRCNN ×2 · ONNX</option>
+        </select>
+      </label>
+      <output class="upscale-status" id="upscale-status" aria-live="polite">320→640</output>
+      <output class="fps-status" id="fps-status" title="End-to-end per-tile throughput, including MediaPipe and the selected upscaler" aria-live="polite">FPS —</output>
       <div class="backlight-compact" title="Music drives this slider while playing; drag it for temporary manual control">
         <label for="rim-intensity">Light</label>
         <input id="rim-intensity" type="range" min="0" max="100" value="40" step="1">
         <input id="rim-color" type="color" value="#8edcff" aria-label="Backlight color">
+        <button class="light-position-pad" id="light-position-pad" type="button" aria-label="Backlight position" aria-valuetext="50% horizontal, 35% vertical" title="Drag to position the light">
+          <span class="light-position-marker" aria-hidden="true"></span>
+        </button>
         <output id="rim-color-output" for="rim-color" hidden>#8edcff</output>
       </div>
-      <span class="hint">MediaPipe multiclass · 256 × 256 · videos survive reload</span>
     </div>
-    <section class="music-panel">
-      <div class="music-copy">
-        <strong>Music preview</strong>
-        <small>Search and stream 30-second previews</small>
-      </div>
-      <div class="music-controls">
-        <form class="music-search" id="music-search-form">
-          <input id="music-search-input" type="search" placeholder="Search Apple Music" aria-label="Search Apple Music" autocomplete="off">
-          <button type="submit">Search</button>
-        </form>
-        <div class="music-results" id="music-results" hidden></div>
-        <div class="now-playing" id="now-playing" hidden>
-          <img id="music-artwork" alt="">
-          <button class="preview-toggle" id="preview-toggle" type="button" aria-label="Pause preview">Ⅱ</button>
-          <div class="track-copy"><strong id="track-name"></strong><span id="track-artist"></span></div>
-          <a id="track-link" target="_blank" rel="noopener">Open in Apple Music ↗</a>
-        </div>
-        <div class="music-footnote"><span id="music-status">Enter a song or artist.</span><span>Preview provided courtesy of iTunes</span></div>
-      </div>
-    </section>
-    <section class="reference-strip drop-target" id="reference-strip" title="Drop a reference image here" hidden>
+    <section class="reference-strip drop-target" id="reference-strip" role="button" tabindex="0" aria-label="Choose or drop a reference image" title="Click or drop a reference image here" hidden>
       <img class="reference-thumb" id="reference-thumb" alt="Lighting reference">
       <div class="reference-copy"><span class="reference-label">Reference look</span><strong id="reference-name"></strong><span id="reference-stats">Analyzing reference…</span></div>
       <button class="remove" id="reset-reference" title="Restore default reference" aria-label="Restore default reference">✕</button>
     </section>
     <section class="grid" id="grid" data-tile-shape="portrait">
-      <button class="add-video-tile drop-target" id="add-video-tile" type="button" aria-label="Add videos">
+      <div class="add-video-tile drop-target" id="add-video-tile" role="button" tabindex="0" aria-label="Add videos">
         <span class="add-video-icon">＋</span>
         <strong>Add videos</strong>
         <small>Drop files here or click to browse</small>
-      </button>
+        <button class="add-webcam" id="add-webcam" type="button">Webcam</button>
+      </div>
     </section>
   </main>`;
 
@@ -200,7 +198,6 @@ class SegmenterPool {
   async load() {
     if (this.model) return this.model;
     if (this.loading) return this.loading;
-    setModelStatus("Loading person model…");
     this.loading = (async () => {
       const vision = await FilesetResolver.forVisionTasks(WASM_URL);
       this.model = await ImageSegmenter.createFromOptions(vision, {
@@ -209,7 +206,6 @@ class SegmenterPool {
         outputCategoryMask: false,
         outputConfidenceMasks: true
       });
-      setModelStatus("Person model ready", true);
       return this.model;
     })().catch((error) => {
       setModelStatus("Person model unavailable");
@@ -474,7 +470,6 @@ class VideoSource {
   active = true;
   readonly video = document.createElement("video");
   private canvas = document.createElement("canvas");
-  private maskCanvas = document.createElement("canvas");
   private renderer: RelightRenderer;
   private card = document.createElement("article");
   private lastAnalysis = 0;
@@ -490,6 +485,9 @@ class VideoSource {
   private pairedCtx = this.pairedFrame.getContext("2d", { alpha: false })!;
   private hasPairedFrame = false;
   private sourceTextureDirty = true;
+  private stageFps = new Map<UpscaleMethod, number>();
+  private segmentationFps = 0;
+  private lastSegmentationCompletedAt = 0;
 
   constructor(file: File | MediaStream, name: string, private storedId?: string) {
     this.video.className = "source-video";
@@ -504,19 +502,51 @@ class VideoSource {
       this.objectUrl = URL.createObjectURL(file);
       this.video.src = this.objectUrl;
     }
-    this.maskCanvas.className = "mask-preview";
-    this.maskCanvas.hidden = !showMask;
     this.card.className = "video-card";
+    this.card.tabIndex = 0;
+    this.card.setAttribute("role", "button");
+    this.card.setAttribute("aria-label", `Pause ${name}`);
     this.card.innerHTML = `<div class="stage"><button class="remove" title="Remove">✕</button></div>`;
-    this.card.querySelector(".stage")!.append(this.video, this.canvas, this.maskCanvas);
+    this.card.querySelector(".stage")!.append(this.video, this.canvas);
     const removeButton = this.card.querySelector<HTMLButtonElement>(".remove")!;
     removeButton.setAttribute("aria-label", `Remove ${name}`);
-    removeButton.addEventListener("click", () => this.remove());
+    removeButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      this.remove();
+    });
+    this.card.addEventListener("click", (event) => {
+      if (!(event.target as Element).closest(".remove")) void this.togglePlayback(name);
+    });
+    this.card.addEventListener("keydown", (event) => {
+      if (event.target !== this.card || (event.key !== "Enter" && event.key !== " ")) return;
+      event.preventDefault();
+      void this.togglePlayback(name);
+    });
     const grid = document.querySelector("#grid")!;
     grid.insertBefore(this.card, document.querySelector("#add-video-tile"));
-    this.renderer = new RelightRenderer(this.canvas);
+    this.renderer = new RelightRenderer(
+      this.canvas,
+      setUpscaleStatus,
+      (fps, method) => this.acceptStageFps(fps, method)
+    );
     this.video.addEventListener("loadeddata", () => this.video.play().catch(() => {}));
     this.tick();
+  }
+
+  private async togglePlayback(name: string) {
+    if (this.video.paused) {
+      try {
+        await this.video.play();
+        this.card.classList.remove("is-paused");
+        this.card.setAttribute("aria-label", `Pause ${name}`);
+      } catch (error) {
+        console.error("Could not resume video", error);
+      }
+    } else {
+      this.video.pause();
+      this.card.classList.add("is-paused");
+      this.card.setAttribute("aria-label", `Play ${name}`);
+    }
   }
 
   private tick = () => {
@@ -583,10 +613,40 @@ class VideoSource {
     this.renderer.updateFraming(alpha, matte.width, matte.height);
     this.hasPairedFrame = true;
     this.sourceTextureDirty = true;
-    this.updateMaskPreview(alpha, matte.width, matte.height);
     this.updateExposure(alpha, matte.width, matte.height);
     this.renderer.render(this.pairedFrame, state, true);
     this.sourceTextureDirty = false;
+    this.recordSegmentationCompletion();
+  }
+
+  private acceptStageFps(fps: number, method: UpscaleMethod) {
+    this.stageFps.set(method, fps);
+    this.publishPipelineFps(method);
+  }
+
+  private recordSegmentationCompletion() {
+    const now = performance.now();
+    if (this.lastSegmentationCompletedAt) {
+      const instantaneousFps = 1000 / Math.max(1, now - this.lastSegmentationCompletedAt);
+      this.segmentationFps = this.segmentationFps
+        ? this.segmentationFps * .75 + instantaneousFps * .25
+        : instantaneousFps;
+      this.publishPipelineFps(state.upscaleMethod);
+    }
+    this.lastSegmentationCompletedAt = now;
+  }
+
+  private publishPipelineFps(method: UpscaleMethod) {
+    const stageFps = this.stageFps.get(method);
+    if (!stageFps || (state.isolate && !this.segmentationFps)) return;
+    const pipelineFps = state.isolate ? Math.min(this.segmentationFps, stageFps) : stageFps;
+    setMeasuredFps(pipelineFps, method);
+  }
+
+  resetPerformanceMeter() {
+    this.stageFps.clear();
+    this.segmentationFps = 0;
+    this.lastSegmentationCompletedAt = 0;
   }
 
   private updateExposure(mask: Uint8Array, width: number, height: number) {
@@ -651,23 +711,6 @@ class VideoSource {
     this.renderer.autoEv += (desiredEv - this.renderer.autoEv) * .07;
   }
 
-  private updateMaskPreview(mask: Uint8Array, width: number, height: number) {
-    this.maskCanvas.width = width;
-    this.maskCanvas.height = height;
-    const ctx = this.maskCanvas.getContext("2d")!;
-    const image = ctx.createImageData(width, height);
-    for (let i = 0; i < mask.length; i++) {
-      const p = i * 4;
-      image.data[p] = mask[i] ? 214 : 20;
-      image.data[p + 1] = mask[i] ? 255 : 21;
-      image.data[p + 2] = mask[i] ? 87 : 24;
-      image.data[p + 3] = 255;
-    }
-    ctx.putImageData(image, 0, 0);
-  }
-
-  setMaskVisible(visible: boolean) { this.maskCanvas.hidden = !visible; }
-
   remove() {
     this.active = false;
     segmenter.remove(this);
@@ -681,9 +724,21 @@ class VideoSource {
   }
 }
 
-function setModelStatus(message: string, ready = false) {
-  document.querySelector("#model-status")!.textContent = message;
-  document.querySelector("#model-dot")!.classList.toggle("ready", ready);
+function setModelStatus(message: string) {
+  console.warn(message);
+}
+
+function setUpscaleStatus(message: string, error = false) {
+  const output = document.querySelector<HTMLOutputElement>("#upscale-status");
+  if (!output) return;
+  output.value = message;
+  output.classList.toggle("error", error);
+}
+
+function setMeasuredFps(fps: number, method: UpscaleMethod) {
+  if (method !== state.upscaleMethod) return;
+  const output = document.querySelector<HTMLOutputElement>("#fps-status");
+  if (output) output.value = `FPS ${fps >= 10 ? fps.toFixed(0) : fps.toFixed(1)}`;
 }
 
 function addSource(source: File | MediaStream, name: string, storedId?: string) {
@@ -771,16 +826,12 @@ function searchMusic(term: string) {
   });
 }
 
-function artworkUrl(track: MusicTrack) {
-  return (track.artworkUrl100 ?? "").replace("100x100bb", "160x160bb").replace(/^http:/, "https:");
-}
-
 function renderMusicResults(tracks: MusicTrack[]) {
   const results = document.querySelector<HTMLElement>("#music-results")!;
   results.replaceChildren();
   if (!tracks.length) {
     const empty = document.createElement("div");
-    empty.className = "music-result";
+    empty.className = "music-result-empty";
     empty.textContent = "No playable previews found.";
     results.append(empty);
   }
@@ -788,19 +839,7 @@ function renderMusicResults(tracks: MusicTrack[]) {
     const button = document.createElement("button");
     button.className = "music-result";
     button.type = "button";
-    const art = document.createElement("img");
-    art.src = artworkUrl(track);
-    art.alt = "";
-    const copy = document.createElement("span");
-    copy.className = "track-copy";
-    const title = document.createElement("strong");
-    title.textContent = track.trackName;
-    const artist = document.createElement("span");
-    artist.textContent = track.artistName;
-    copy.append(title, artist);
-    const play = document.createElement("span");
-    play.textContent = "▶";
-    button.append(art, copy, play);
+    button.textContent = `${track.trackName} — ${track.artistName}`;
     button.addEventListener("click", () => void playTrack(track));
     results.append(button);
   }
@@ -899,7 +938,6 @@ function startMeter() {
 
 async function playTrack(track: MusicTrack) {
   if (!track.previewUrl) return;
-  const status = document.querySelector<HTMLElement>("#music-status")!;
   try {
     ensureAudioGraph();
     await audioContext!.resume();
@@ -909,24 +947,16 @@ async function playTrack(track: MusicTrack) {
       previousSpectrum?.fill(0);
       lastBeatAt = -Infinity;
       previewAudio.src = track.previewUrl.replace(/^http:/, "https:");
-      document.querySelector<HTMLImageElement>("#music-artwork")!.src = artworkUrl(track);
-      document.querySelector<HTMLElement>("#track-name")!.textContent = track.trackName;
-      document.querySelector<HTMLElement>("#track-artist")!.textContent = track.artistName;
-      const link = document.querySelector<HTMLAnchorElement>("#track-link")!;
-      link.href = track.trackViewUrl ?? "https://music.apple.com/";
     }
     await previewAudio.play();
     state.audioReactive = !rimSliderHeld;
-    document.querySelector<HTMLElement>("#now-playing")!.hidden = false;
     document.querySelector<HTMLElement>("#music-results")!.hidden = true;
-    document.querySelector<HTMLButtonElement>("#preview-toggle")!.textContent = "Ⅱ";
-    document.querySelector<HTMLButtonElement>("#preview-toggle")!.setAttribute("aria-label", "Pause preview");
-    status.textContent = "Playing preview";
+    document.querySelector<HTMLInputElement>("#music-search-input")!.value = `${track.trackName} — ${track.artistName}`;
+    document.querySelector<HTMLButtonElement>("#music-stop")!.hidden = false;
     startMeter();
   } catch (error) {
     state.audioReactive = false;
     console.error(error);
-    status.textContent = "This preview could not be played.";
   }
 }
 
@@ -935,45 +965,30 @@ document.querySelector<HTMLFormElement>("#music-search-form")!.addEventListener(
   const input = document.querySelector<HTMLInputElement>("#music-search-input")!;
   const term = input.value.trim();
   if (!term) return;
-  const status = document.querySelector<HTMLElement>("#music-status")!;
-  status.textContent = "Searching…";
+  const submit = document.querySelector<HTMLButtonElement>(".music-submit")!;
+  submit.disabled = true;
+  submit.textContent = "…";
   document.querySelector<HTMLElement>("#music-results")!.hidden = true;
   try {
     const tracks = await searchMusic(term);
     renderMusicResults(tracks);
-    status.textContent = tracks.length ? `${tracks.length} previews found` : "No playable previews found.";
   } catch (error) {
     console.error(error);
-    status.textContent = "Search is temporarily unavailable.";
+  } finally {
+    submit.disabled = false;
+    submit.textContent = "Search";
   }
 });
 
-document.querySelector<HTMLButtonElement>("#preview-toggle")!.addEventListener("click", async () => {
-  const button = document.querySelector<HTMLButtonElement>("#preview-toggle")!;
-  if (previewAudio.paused) {
-    await audioContext?.resume();
-    await previewAudio.play();
-    state.audioReactive = !rimSliderHeld;
-    button.textContent = "Ⅱ";
-    button.setAttribute("aria-label", "Pause preview");
-    document.querySelector<HTMLElement>("#music-status")!.textContent = "Playing preview";
-    startMeter();
-  } else {
-    previewAudio.pause();
-    state.audioReactive = false;
-    button.textContent = "▶";
-    button.setAttribute("aria-label", "Play preview");
-    document.querySelector<HTMLElement>("#music-status")!.textContent = "Preview paused";
-    startMeter();
-  }
-});
-
-previewAudio.addEventListener("ended", () => {
+document.querySelector<HTMLButtonElement>("#music-stop")!.addEventListener("click", () => {
+  previewAudio.pause();
+  previewAudio.removeAttribute("src");
+  previewAudio.load();
+  currentTrack = undefined;
   state.audioReactive = false;
-  const button = document.querySelector<HTMLButtonElement>("#preview-toggle")!;
-  button.textContent = "▶";
-  button.setAttribute("aria-label", "Play preview");
-  document.querySelector<HTMLElement>("#music-status")!.textContent = "Preview ended";
+  document.querySelector<HTMLInputElement>("#music-search-input")!.value = "";
+  document.querySelector<HTMLElement>("#music-results")!.hidden = true;
+  document.querySelector<HTMLButtonElement>("#music-stop")!.hidden = true;
   startMeter();
 });
 
@@ -982,17 +997,18 @@ document.querySelector<HTMLInputElement>("#auto-adjust")!.addEventListener("chan
 });
 document.querySelector<HTMLInputElement>("#isolate")!.addEventListener("change", (event) => {
   state.isolate = (event.target as HTMLInputElement).checked;
+  document.querySelector<HTMLOutputElement>("#fps-status")!.value = "FPS …";
+  sources.forEach((source) => source.resetPerformanceMeter());
   if (state.isolate) void segmenter.load();
-});
-document.querySelector<HTMLInputElement>("#show-mask")!.addEventListener("change", (event) => {
-  showMask = (event.target as HTMLInputElement).checked;
-  sources.forEach((source) => source.setMaskVisible(showMask));
 });
 document.querySelector<HTMLInputElement>("#reference-background")!.addEventListener("change", (event) => {
   state.replaceBackground = (event.target as HTMLInputElement).checked;
 });
-document.querySelector<HTMLInputElement>("#lab-transfer")!.addEventListener("change", (event) => {
-  state.labTransfer = (event.target as HTMLInputElement).checked;
+document.querySelector<HTMLInputElement>("#show-light")!.addEventListener("change", (event) => {
+  state.showLight = (event.target as HTMLInputElement).checked;
+});
+document.querySelector<HTMLInputElement>("#rcas")!.addEventListener("change", (event) => {
+  state.rcasEnabled = (event.target as HTMLInputElement).checked;
 });
 document.querySelectorAll<HTMLButtonElement>("[data-shape]").forEach((button) => {
   button.addEventListener("click", () => {
@@ -1004,6 +1020,13 @@ document.querySelectorAll<HTMLButtonElement>("[data-shape]").forEach((button) =>
       item.setAttribute("aria-pressed", String(active));
     });
   });
+});
+document.querySelector<HTMLSelectElement>("#upscale-method")!.addEventListener("change", (event) => {
+  state.upscaleMethod = (event.target as HTMLSelectElement).value as UpscaleMethod;
+  document.querySelector<HTMLOutputElement>("#fps-status")!.value = "FPS …";
+  sources.forEach((source) => source.resetPerformanceMeter());
+  const neural = state.upscaleMethod === "websr" || state.upscaleMethod === "fsrcnn";
+  setUpscaleStatus(neural ? (navigator.gpu ? "Preparing WebGPU…" : "WebGPU unavailable") : "320→640", neural && !navigator.gpu);
 });
 const rimSlider = document.querySelector<HTMLInputElement>("#rim-intensity")!;
 const beginManualRimControl = () => {
@@ -1033,8 +1056,74 @@ document.querySelector<HTMLInputElement>("#rim-color")!.addEventListener("input"
   state.rimColor = hexToColor(value);
   document.querySelector<HTMLOutputElement>("#rim-color-output")!.value = value;
 });
-document.querySelector("#add-video-tile")!.addEventListener("click", () => document.querySelector<HTMLInputElement>("#file-input")!.click());
-document.querySelector("#reference")!.addEventListener("click", () => document.querySelector<HTMLInputElement>("#reference-input")!.click());
+
+const lightPositionPad = document.querySelector<HTMLButtonElement>("#light-position-pad")!;
+const lightPositionMarker = lightPositionPad.querySelector<HTMLElement>(".light-position-marker")!;
+
+function updateLightPositionUi() {
+  const [x, y] = state.lightPosition;
+  const xPercent = Math.round(x * 100);
+  const yPercent = Math.round(y * 100);
+  lightPositionMarker.style.left = `${xPercent}%`;
+  lightPositionMarker.style.top = `${yPercent}%`;
+  lightPositionPad.style.setProperty("--light-x", `${xPercent}%`);
+  lightPositionPad.style.setProperty("--light-y", `${yPercent}%`);
+  lightPositionPad.setAttribute("aria-valuetext", `${xPercent}% horizontal, ${yPercent}% vertical`);
+}
+
+function setLightPositionFromPointer(event: PointerEvent) {
+  const bounds = lightPositionPad.getBoundingClientRect();
+  const x = Math.max(.04, Math.min(.96, (event.clientX - bounds.left) / bounds.width));
+  const y = Math.max(.04, Math.min(.96, (event.clientY - bounds.top) / bounds.height));
+  state.lightPosition = [x, y];
+  updateLightPositionUi();
+}
+
+lightPositionPad.addEventListener("pointerdown", (event) => {
+  event.preventDefault();
+  lightPositionPad.setPointerCapture(event.pointerId);
+  setLightPositionFromPointer(event);
+});
+lightPositionPad.addEventListener("pointermove", (event) => {
+  if (lightPositionPad.hasPointerCapture(event.pointerId)) setLightPositionFromPointer(event);
+});
+lightPositionPad.addEventListener("pointerup", (event) => {
+  if (lightPositionPad.hasPointerCapture(event.pointerId)) lightPositionPad.releasePointerCapture(event.pointerId);
+});
+lightPositionPad.addEventListener("keydown", (event) => {
+  const step = event.shiftKey ? .1 : .03;
+  let [x, y] = state.lightPosition;
+  if (event.key === "ArrowLeft") x -= step;
+  else if (event.key === "ArrowRight") x += step;
+  else if (event.key === "ArrowUp") y -= step;
+  else if (event.key === "ArrowDown") y += step;
+  else if (event.key === "Home") [x, y] = [.5, .35];
+  else return;
+  event.preventDefault();
+  state.lightPosition = [Math.max(.04, Math.min(.96, x)), Math.max(.04, Math.min(.96, y))];
+  updateLightPositionUi();
+});
+updateLightPositionUi();
+const addVideoTile = document.querySelector<HTMLElement>("#add-video-tile")!;
+const openVideoPicker = () => document.querySelector<HTMLInputElement>("#file-input")!.click();
+addVideoTile.addEventListener("click", (event) => {
+  if (!(event.target as Element).closest("#add-webcam")) openVideoPicker();
+});
+addVideoTile.addEventListener("keydown", (event) => {
+  if (event.target !== addVideoTile || (event.key !== "Enter" && event.key !== " ")) return;
+  event.preventDefault();
+  openVideoPicker();
+});
+const referenceStrip = document.querySelector<HTMLElement>("#reference-strip")!;
+const openReferencePicker = () => document.querySelector<HTMLInputElement>("#reference-input")!.click();
+referenceStrip.addEventListener("click", (event) => {
+  if (!(event.target as Element).closest("#reset-reference")) openReferencePicker();
+});
+referenceStrip.addEventListener("keydown", (event) => {
+  if (event.target !== referenceStrip || (event.key !== "Enter" && event.key !== " ")) return;
+  event.preventDefault();
+  openReferencePicker();
+});
 async function setReferenceFile(file: File) {
   try {
     await referenceAnalyzer.analyze(file);
@@ -1050,7 +1139,10 @@ document.querySelector<HTMLInputElement>("#reference-input")!.addEventListener("
   if (file) await setReferenceFile(file);
   input.value = "";
 });
-document.querySelector("#reset-reference")!.addEventListener("click", () => void loadDefaultReference());
+document.querySelector("#reset-reference")!.addEventListener("click", (event) => {
+  event.stopPropagation();
+  void loadDefaultReference();
+});
 document.querySelector<HTMLInputElement>("#file-input")!.addEventListener("change", async (event) => {
   const input = event.target as HTMLInputElement;
   await Promise.all(Array.from(input.files ?? []).map(addVideoFile));
@@ -1089,21 +1181,17 @@ function bindFileDrop(
 }
 
 bindFileDrop(
-  document.querySelector<HTMLElement>("#reference")!,
+  referenceStrip,
   (file) => file.type.startsWith("image/"),
   async ([file]) => { if (file) await setReferenceFile(file); }
 );
 bindFileDrop(
-  document.querySelector<HTMLElement>("#reference-strip")!,
-  (file) => file.type.startsWith("image/"),
-  async ([file]) => { if (file) await setReferenceFile(file); }
-);
-bindFileDrop(
-  document.querySelector<HTMLElement>("#add-video-tile")!,
+  addVideoTile,
   (file) => file.type.startsWith("video/"),
   async (files) => { await Promise.all(files.map(addVideoFile)); }
 );
-document.querySelector("#webcam")!.addEventListener("click", async () => {
+document.querySelector("#add-webcam")!.addEventListener("click", async (event) => {
+  event.stopPropagation();
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
     addSource(stream, "Live camera");

@@ -1,3 +1,8 @@
+import { NeuralUpscaler, type NeuralUpscaleMethod } from "./neural-upscaler";
+
+export type UpscaleMethod = "bilinear" | "lanczos2" | "fsr1" | "anime4k" | "websr" | "fsrcnn";
+type SpatialUpscaleMethod = Exclude<UpscaleMethod, NeuralUpscaleMethod>;
+
 export type Look = {
   autoAdjust: boolean;
   targetLuma: number;
@@ -19,17 +24,29 @@ export type Look = {
   referenceBackgroundColor: [number, number, number];
   replaceBackground: boolean;
   rimIntensity: number;
+  showLight: boolean;
+  lightPosition: [number, number];
   audioReactive: boolean;
   audioLevel: number;
   audioBeat: number;
   rimColor: [number, number, number];
+  upscaleMethod: UpscaleMethod;
+  rcasEnabled: boolean;
 };
 
 const vertexShader = `#version 300 es
-in vec2 a_position;
+layout(location = 0) in vec2 a_position;
 out vec2 v_uv;
 void main() {
   v_uv = vec2(a_position.x * .5 + .5, 1. - (a_position.y * .5 + .5));
+  gl_Position = vec4(a_position, 0., 1.);
+}`;
+
+const postVertexShader = `#version 300 es
+layout(location = 0) in vec2 a_position;
+out vec2 v_uv;
+void main() {
+  v_uv = a_position * .5 + .5;
   gl_Position = vec4(a_position, 0., 1.);
 }`;
 
@@ -65,6 +82,8 @@ uniform vec3 u_referenceBackgroundColor;
 uniform float u_replaceBackground;
 uniform vec2 u_maskTexel;
 uniform float u_rimIntensity;
+uniform float u_showLight;
+uniform vec2 u_lightPosition;
 uniform vec3 u_rimColor;
 uniform float u_viewZoom;
 uniform vec2 u_viewCenter;
@@ -137,6 +156,19 @@ vec3 screenLight(vec3 base, vec3 light) {
   return 1. - (1. - base) * (1. - clamp(light, 0., 1.));
 }
 
+vec3 srgbToLinear(vec3 color) {
+  return mix(color / 12.92, pow((color + .055) / 1.055, vec3(2.4)), step(vec3(.04045), color));
+}
+
+vec3 linearToSrgb(vec3 color) {
+  vec3 positive = max(color, vec3(0.));
+  return clamp(mix(12.92 * positive, 1.055 * pow(positive, vec3(1. / 2.4)) - .055, step(vec3(.0031308), positive)), 0., 1.);
+}
+
+vec3 acesToneMap(vec3 color) {
+  return clamp((color * (2.51 * color + .03)) / (color * (2.43 * color + .59) + .14), 0., 1.);
+}
+
 void main() {
   vec2 sampleUv = (v_uv - vec2(.5)) / u_viewZoom + u_viewCenter;
   float insideView = step(0., sampleUv.x) * step(sampleUv.x, 1.) * step(0., sampleUv.y) * step(sampleUv.y, 1.);
@@ -160,10 +192,10 @@ void main() {
   vec3 background = mix(backgroundRgb, transferLab(source, u_sourceBackgroundLabMean, u_sourceBackgroundLabStd, u_referenceBackgroundLabMean, u_referenceBackgroundLabStd), labAmount);
   foreground = grade(foreground, u_autoEv + u_manualEv);
 
-  // Approximate a local signed-distance field around the matte boundary. The
-  // near ring yields a one-to-two-pixel rim; a farther ring identifies only
-  // pixels a few samples inside the silhouette for restrained light spill.
-  vec2 edgeRadius = d * 1.5;
+  // Estimate the silhouette normal from the continuous matte. Keeping this
+  // radius close to one model texel avoids turning the 256px contour into a
+  // thick stroke after the frame is reconstructed at 640px.
+  vec2 edgeRadius = d * .9;
   float sampleL = texture(u_mask, sampleUv - vec2(edgeRadius.x, 0.)).r;
   float sampleR = texture(u_mask, sampleUv + vec2(edgeRadius.x, 0.)).r;
   float sampleU = texture(u_mask, sampleUv - vec2(0., edgeRadius.y)).r;
@@ -176,10 +208,10 @@ void main() {
   float diagonalGradient = length(vec2(sampleDR - sampleUL, sampleDL - sampleUR));
   float contourGradient = clamp(straightGradient * .72 + diagonalGradient * .34, 0., 1.);
   float confidenceEdge = 1. - abs(matteAlpha * 2. - 1.);
-  float innerBand = smoothstep(.1, .5, max(contourGradient, confidenceEdge * .72))
-    * smoothstep(.28, .72, matteAlpha);
+  float edgeProfile = pow(clamp(contourGradient * .78 + confidenceEdge * .22, 0., 1.), 1.45);
+  float innerBand = edgeProfile * smoothstep(.2, .72, matteAlpha);
 
-  vec2 spillRadius = d * 4.5;
+  vec2 spillRadius = d * 2.75;
   float spillL = texture(u_mask, sampleUv - vec2(spillRadius.x, 0.)).r;
   float spillR = texture(u_mask, sampleUv + vec2(spillRadius.x, 0.)).r;
   float spillU = texture(u_mask, sampleUv - vec2(0., spillRadius.y)).r;
@@ -195,7 +227,7 @@ void main() {
   // The light source is a radial field in the background, not a dilation of
   // the silhouette. Auto-framing keeps the upper torso close to this fixed
   // position. Multiple falloffs emulate a hot source plus optical bloom.
-  vec2 lightCenter = vec2(.5, .35);
+  vec2 lightCenter = u_lightPosition;
   vec2 wideDelta = (v_uv - lightCenter) / vec2(.48, .42);
   vec2 coreDelta = (v_uv - lightCenter) / vec2(.22, .2);
   float wideHalo = exp(-dot(wideDelta, wideDelta) * 1.35);
@@ -203,23 +235,45 @@ void main() {
   float hotCore = exp(-dot(coreDelta, coreDelta) * 3.2);
   float irradiance = clamp(wideHalo * .12 + mediumHalo * .28 + hotCore * .72, 0., 1.);
 
+  // A backlight only catches contour points whose outward matte normal faces
+  // away from the centered source. This prevents every mask edge from being
+  // painted with the same opacity.
+  vec2 matteGradient = vec2(sampleR - sampleL, sampleD - sampleU);
+  float gradientLength = length(matteGradient);
+  vec2 outwardNormal = -matteGradient / max(gradientLength, .0001);
+  vec2 radialDirection = normalize(v_uv - lightCenter + vec2(.00001));
+  float facingAlignment = smoothstep(-.35, .85, dot(outwardNormal, radialDirection));
+  float sourceFacing = mix(.18, 1., facingAlignment) * smoothstep(.01, .13, gradientLength);
+  float rimIrradiance = mix(.16, 1., smoothstep(.025, .78, irradiance));
+
   vec2 floorDelta = (v_uv - vec2(.5, .92)) / vec2(.3, .055);
   float floorPool = exp(-dot(floorDelta, floorDelta) * 2.2) * .2;
 
   vec3 rimColor = u_rimColor;
   float sourceLuma = dot(foreground, vec3(.2126, .7152, .0722));
-  float edgeTransmission = mix(1.28, .72, matteAlpha);
-  float materialResponse = mix(1.08, .62, sourceLuma);
-  float rim = innerBand * mix(.55, 1., irradiance) * edgeTransmission * materialResponse
-    * u_rimIntensity * 1.2 * u_isolate;
-  float spill = inwardBand * mix(.4, 1., irradiance) * materialResponse
-    * u_rimIntensity * .13 * u_isolate;
-  foreground = screenLight(foreground, rimColor * (rim + spill));
+  float materialResponse = mix(1., .68, sourceLuma);
+  float rimShape = innerBand * sourceFacing * rimIrradiance * materialResponse;
+  float spillShape = inwardBand * sourceFacing * rimIrradiance * materialResponse;
+
+  // Relight the existing material in linear RGB instead of screening a flat
+  // colored strip over it. The high end of the slider reaches a much stronger
+  // exposure, while ACES compression retains folds instead of clipping them
+  // into a solid white or colored band.
+  float intensityCurve = pow(u_rimIntensity, 1.25);
+  float rimEnergy = clamp((rimShape + spillShape * .22) * intensityCurve * u_isolate, 0., 1.);
+  float exposureStops = mix(1.25, 3.8, pow(u_rimIntensity, 1.6));
+  vec3 foregroundLinear = srgbToLinear(clamp(foreground, 0., 1.));
+  vec3 lightLinear = srgbToLinear(clamp(rimColor, 0., 1.));
+  vec3 litMaterial = foregroundLinear * exp2(exposureStops);
+  litMaterial += lightLinear * mix(.12, .045, sourceLuma);
+  litMaterial = acesToneMap(litMaterial);
+  foregroundLinear = mix(foregroundLinear, litMaterial, min(1., rimEnergy * 1.45));
+  foreground = linearToSrgb(foregroundLinear);
 
   background = grade(background, u_backgroundEv);
   vec3 solidBackground = clamp(u_referenceBackgroundColor * exp2(u_backgroundEv), 0., 1.);
   background = mix(background, solidBackground, u_replaceBackground);
-  vec3 behindLight = rimColor * (irradiance + floorPool) * u_rimIntensity * u_isolate;
+  vec3 behindLight = rimColor * (irradiance + floorPool) * u_rimIntensity * u_isolate * u_showLight;
   background = screenLight(background, behindLight);
 
   // Compositing with the continuous alpha performs the occlusion: solid body
@@ -227,6 +281,214 @@ void main() {
   // proportional amount of the halo and receive stronger scattering.
   vec3 composite = mix(background, foreground, person);
   outColor = vec4(clamp(composite, 0., 1.), 1.);
+}`;
+
+const bilinearShader = `#version 300 es
+precision highp float;
+uniform sampler2D u_src;
+in vec2 v_uv;
+out vec4 outColor;
+void main() { outColor = vec4(texture(u_src, v_uv).rgb, 1.); }
+`;
+
+const lanczos2Shader = `#version 300 es
+precision highp float;
+uniform sampler2D u_src;
+uniform vec2 u_inSize;
+uniform vec2 u_outSize;
+out vec4 outColor;
+
+float sinc(float x) {
+  x = abs(x);
+  if (x < .0001) return 1.;
+  float p = 3.14159265359 * x;
+  return sin(p) / p;
+}
+float lanczos2(float x) {
+  return abs(x) < 2. ? sinc(x) * sinc(x * .5) : 0.;
+}
+vec3 fetchSource(ivec2 p) {
+  return texelFetch(u_src, clamp(p, ivec2(0), ivec2(u_inSize) - 1), 0).rgb;
+}
+void main() {
+  vec2 sourcePosition = gl_FragCoord.xy * (u_inSize / u_outSize) - .5;
+  ivec2 base = ivec2(floor(sourcePosition));
+  vec2 fraction = sourcePosition - vec2(base);
+  vec3 color = vec3(0.);
+  float weightSum = 0.;
+  for (int y = -1; y <= 2; y++) {
+    for (int x = -1; x <= 2; x++) {
+      float weight = lanczos2(float(x) - fraction.x) * lanczos2(float(y) - fraction.y);
+      color += fetchSource(base + ivec2(x, y)) * weight;
+      weightSum += weight;
+    }
+  }
+  outColor = vec4(clamp(color / max(weightSum, .0001), 0., 1.), 1.);
+}`;
+
+// AMD FidelityFX Super Resolution 1.0 EASU, adapted from the WebGL2
+// non-gather port in natureglass/Fsrlab. Its twelve-tap kernel follows local
+// edge direction, then clamps to the nearest four texels to suppress ringing.
+const fsrEasuShader = `#version 300 es
+precision highp float;
+precision highp int;
+uniform sampler2D u_src;
+uniform vec2 u_inSize;
+uniform vec2 u_outSize;
+out vec4 outColor;
+
+vec3 fetchSource(ivec2 p) {
+  return texelFetch(u_src, clamp(p, ivec2(0), ivec2(u_inSize) - 1), 0).rgb;
+}
+float luminance(vec3 c) { return c.g + .5 * (c.r + c.b); }
+void setDirection(inout vec2 direction, inout float lengthValue, float weight,
+  float a, float b, float c, float d, float e) {
+  float dc = d - c;
+  float cb = c - b;
+  float lengthX = 1. / max(max(abs(dc), abs(cb)), 1e-4);
+  float directionX = d - b;
+  direction.x += directionX * weight;
+  lengthX = clamp(abs(directionX) * lengthX, 0., 1.);
+  lengthValue += lengthX * lengthX * weight;
+  float ec = e - c;
+  float ca = c - a;
+  float lengthY = 1. / max(max(abs(ec), abs(ca)), 1e-4);
+  float directionY = e - a;
+  direction.y += directionY * weight;
+  lengthY = clamp(abs(directionY) * lengthY, 0., 1.);
+  lengthValue += lengthY * lengthY * weight;
+}
+void easuTap(inout vec3 color, inout float weightSum, vec2 offset,
+  vec2 direction, vec2 length2, float lobe, float clipValue, vec3 sampleColor) {
+  vec2 vectorValue = vec2(offset.x * direction.x + offset.y * direction.y,
+    offset.x * -direction.y + offset.y * direction.x) * length2;
+  float distance2 = min(dot(vectorValue, vectorValue), clipValue);
+  float windowWeight = .4 * distance2 - 1.;
+  float lobeWeight = lobe * distance2 - 1.;
+  windowWeight *= windowWeight;
+  lobeWeight *= lobeWeight;
+  windowWeight = 1.5625 * windowWeight - .5625;
+  float weight = windowWeight * lobeWeight;
+  color += sampleColor * weight;
+  weightSum += weight;
+}
+void main() {
+  vec2 ratio = u_inSize / u_outSize;
+  vec2 position = floor(gl_FragCoord.xy) * ratio + .5 * ratio - .5;
+  vec2 floorPosition = floor(position);
+  position -= floorPosition;
+  ivec2 f = ivec2(floorPosition);
+
+  vec3 bC = fetchSource(f + ivec2( 0,-1)), cC = fetchSource(f + ivec2( 1,-1));
+  vec3 eC = fetchSource(f + ivec2(-1, 0)), fC = fetchSource(f);
+  vec3 gC = fetchSource(f + ivec2( 1, 0)), hC = fetchSource(f + ivec2( 2, 0));
+  vec3 iC = fetchSource(f + ivec2(-1, 1)), jC = fetchSource(f + ivec2( 0, 1));
+  vec3 kC = fetchSource(f + ivec2( 1, 1)), lC = fetchSource(f + ivec2( 2, 1));
+  vec3 nC = fetchSource(f + ivec2( 0, 2)), oC = fetchSource(f + ivec2( 1, 2));
+  float bL=luminance(bC), cL=luminance(cC), eL=luminance(eC), fL=luminance(fC);
+  float gL=luminance(gC), hL=luminance(hC), iL=luminance(iC), jL=luminance(jC);
+  float kL=luminance(kC), lL=luminance(lC), nL=luminance(nC), oL=luminance(oC);
+
+  vec2 direction = vec2(0.);
+  float lengthValue = 0.;
+  setDirection(direction,lengthValue,(1.-position.x)*(1.-position.y),bL,eL,fL,gL,jL);
+  setDirection(direction,lengthValue,position.x*(1.-position.y),cL,fL,gL,hL,kL);
+  setDirection(direction,lengthValue,(1.-position.x)*position.y,fL,iL,jL,kL,nL);
+  setDirection(direction,lengthValue,position.x*position.y,gL,jL,kL,lL,oL);
+  float directionLength = dot(direction, direction);
+  bool zeroDirection = directionLength < (1. / 32768.);
+  float inverseDirectionLength = inversesqrt(max(directionLength, 1e-12));
+  direction.x = zeroDirection ? 1. : direction.x;
+  direction *= zeroDirection ? 1. : inverseDirectionLength;
+  lengthValue = lengthValue * .5;
+  lengthValue *= lengthValue;
+  float stretch = dot(direction,direction) / max(max(abs(direction.x),abs(direction.y)),1e-5);
+  vec2 length2 = vec2(1. + (stretch - 1.) * lengthValue, 1. - .5 * lengthValue);
+  float lobe = .5 + ((.25 - .04) - .5) * lengthValue;
+  float clipValue = 1. / lobe;
+  vec3 minimum4 = min(min(fC,gC),min(jC,kC));
+  vec3 maximum4 = max(max(fC,gC),max(jC,kC));
+  vec3 accumulated = vec3(0.);
+  float weightSum = 0.;
+  easuTap(accumulated,weightSum,vec2( 0.,-1.)-position,direction,length2,lobe,clipValue,bC);
+  easuTap(accumulated,weightSum,vec2( 1.,-1.)-position,direction,length2,lobe,clipValue,cC);
+  easuTap(accumulated,weightSum,vec2(-1., 1.)-position,direction,length2,lobe,clipValue,iC);
+  easuTap(accumulated,weightSum,vec2( 0., 1.)-position,direction,length2,lobe,clipValue,jC);
+  easuTap(accumulated,weightSum,vec2( 0., 0.)-position,direction,length2,lobe,clipValue,fC);
+  easuTap(accumulated,weightSum,vec2( 1., 0.)-position,direction,length2,lobe,clipValue,gC);
+  easuTap(accumulated,weightSum,vec2( 1., 1.)-position,direction,length2,lobe,clipValue,kC);
+  easuTap(accumulated,weightSum,vec2( 2., 1.)-position,direction,length2,lobe,clipValue,lC);
+  easuTap(accumulated,weightSum,vec2( 2., 0.)-position,direction,length2,lobe,clipValue,hC);
+  easuTap(accumulated,weightSum,vec2(-1., 0.)-position,direction,length2,lobe,clipValue,eC);
+  easuTap(accumulated,weightSum,vec2( 0., 2.)-position,direction,length2,lobe,clipValue,nC);
+  easuTap(accumulated,weightSum,vec2( 1., 2.)-position,direction,length2,lobe,clipValue,oC);
+  outColor = vec4(clamp(accumulated / weightSum, minimum4, maximum4), 1.);
+}`;
+
+// Lightweight browser port of Anime4K v3.2 Original's edge refinement.
+// The official shader derives a Sobel direction and pulls edge pixels along
+// that direction; this fused pass performs the same operation after scaling.
+const anime4kShader = `#version 300 es
+precision highp float;
+uniform sampler2D u_src;
+uniform vec2 u_inSize;
+in vec2 v_uv;
+out vec4 outColor;
+float luma(vec3 color) { return dot(color, vec3(.299,.587,.114)); }
+float powerFunction(float x) {
+  float x2=x*x, x3=x2*x, x4=x2*x2, x5=x2*x3;
+  return 11.68129591*x5-42.46906057*x4+60.28286266*x3-41.84451327*x2+14.05517353*x-1.08152193;
+}
+void main() {
+  vec2 d = 1. / u_inSize;
+  float tl=luma(texture(u_src,v_uv+d*vec2(-1.,-1.)).rgb);
+  float t =luma(texture(u_src,v_uv+d*vec2( 0.,-1.)).rgb);
+  float tr=luma(texture(u_src,v_uv+d*vec2( 1.,-1.)).rgb);
+  float l =luma(texture(u_src,v_uv+d*vec2(-1., 0.)).rgb);
+  float r =luma(texture(u_src,v_uv+d*vec2( 1., 0.)).rgb);
+  float bl=luma(texture(u_src,v_uv+d*vec2(-1., 1.)).rgb);
+  float b =luma(texture(u_src,v_uv+d*vec2( 0., 1.)).rgb);
+  float br=luma(texture(u_src,v_uv+d*vec2( 1., 1.)).rgb);
+  vec2 gradient = vec2(-tl-2.*l-bl+tr+2.*r+br, -tl-2.*t-tr+bl+2.*b+br);
+  float edge = clamp(length(gradient),0.,1.);
+  float refine = clamp(powerFunction(edge) * .5,0.,1.);
+  vec2 direction = gradient / max(length(gradient),.0001);
+  vec2 pull = vec2(-sign(direction.x)*d.x, -sign(direction.y)*d.y);
+  float ratio = abs(direction.x)/(abs(direction.x)+abs(direction.y)+.0001);
+  vec3 xValue=texture(u_src,v_uv+vec2(pull.x,0.)).rgb;
+  vec3 yValue=texture(u_src,v_uv+vec2(0.,pull.y)).rgb;
+  vec3 base=texture(u_src,v_uv).rgb;
+  outColor=vec4(clamp(mix(base,mix(yValue,xValue,ratio),refine),0.,1.),1.);
+}`;
+
+const finalShader = `#version 300 es
+precision highp float;
+precision highp int;
+uniform sampler2D u_src;
+uniform vec2 u_size;
+uniform float u_applyRcas;
+out vec4 outColor;
+vec3 fetchSource(ivec2 p) {
+  return texelFetch(u_src, clamp(p,ivec2(0),ivec2(u_size)-1),0).rgb;
+}
+vec3 rcas(ivec2 p) {
+  vec3 b=fetchSource(p+ivec2(0,-1));
+  vec3 d=fetchSource(p+ivec2(-1,0));
+  vec3 e=fetchSource(p);
+  vec3 f=fetchSource(p+ivec2(1,0));
+  vec3 h=fetchSource(p+ivec2(0,1));
+  vec3 minimum4=min(min(b,d),min(f,h));
+  vec3 maximum4=max(max(b,d),max(f,h));
+  vec3 hitMin=minimum4/(4.*maximum4+1e-4);
+  vec3 hitMax=(1.-maximum4)/(4.*minimum4-4.-1e-4);
+  vec3 lobeRgb=max(-hitMin,hitMax);
+  float lobe=max(-.1875,min(max(lobeRgb.r,max(lobeRgb.g,lobeRgb.b)),0.))*.87;
+  return clamp((lobe*(b+d+f+h)+e)/(4.*lobe+1.),0.,1.);
+}
+void main() {
+  ivec2 p=ivec2(gl_FragCoord.xy);
+  vec3 plain=fetchSource(p);
+  outColor=vec4(mix(plain,rcas(p),u_applyRcas),1.);
 }`;
 
 function compile(gl: WebGL2RenderingContext, type: number, source: string) {
@@ -237,11 +499,37 @@ function compile(gl: WebGL2RenderingContext, type: number, source: string) {
   return shader;
 }
 
+function createProgram(gl: WebGL2RenderingContext, fragmentSource: string, vertexSource = postVertexShader) {
+  const program = gl.createProgram()!;
+  gl.attachShader(program, compile(gl, gl.VERTEX_SHADER, vertexSource));
+  gl.attachShader(program, compile(gl, gl.FRAGMENT_SHADER, fragmentSource));
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program) ?? "Shader link failed");
+  return program;
+}
+
+const INTERNAL_SIZE = 320;
+const OUTPUT_SIZE = 640;
+
 export class RelightRenderer {
   private gl: WebGL2RenderingContext;
   private program: WebGLProgram;
+  private upscalePrograms: Record<SpatialUpscaleMethod, WebGLProgram>;
+  private finalProgram: WebGLProgram;
   private videoTexture: WebGLTexture;
   private maskTexture: WebGLTexture;
+  private relightTexture: WebGLTexture;
+  private relightFramebuffer: WebGLFramebuffer;
+  private upscaleTexture: WebGLTexture;
+  private upscaleFramebuffer: WebGLFramebuffer;
+  private neuralTexture: WebGLTexture;
+  private neuralUpscaler: NeuralUpscaler;
+  private neuralReadback = new Uint8Array(INTERNAL_SIZE * INTERNAL_SIZE * 4);
+  private neuralReadbackCanvas = document.createElement("canvas");
+  private neuralReadbackContext = this.neuralReadbackCanvas.getContext("2d", { alpha: false })!;
+  private spatialFrameCount = 0;
+  private spatialFpsStartedAt = performance.now();
+  private measuredMethod?: UpscaleMethod;
   private maskWidth = 1;
   private maskHeight = 1;
   autoEv = 0;
@@ -257,27 +545,46 @@ export class RelightRenderer {
   viewCenter: [number, number] = [.5, .5];
   private framingInitialized = false;
 
-  constructor(private canvas: HTMLCanvasElement) {
+  constructor(
+    private canvas: HTMLCanvasElement,
+    reportUpscaleStatus: (message: string, error?: boolean) => void = () => {},
+    private reportFps: (fps: number, method: UpscaleMethod) => void = () => {}
+  ) {
     const gl = canvas.getContext("webgl2", { alpha: false, antialias: false });
     if (!gl) throw new Error("This browser does not support WebGL 2");
     this.gl = gl;
-    this.program = gl.createProgram()!;
-    gl.attachShader(this.program, compile(gl, gl.VERTEX_SHADER, vertexShader));
-    gl.attachShader(this.program, compile(gl, gl.FRAGMENT_SHADER, fragmentShader));
-    gl.linkProgram(this.program);
-    if (!gl.getProgramParameter(this.program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(this.program) ?? "Shader link failed");
+    this.canvas.width = OUTPUT_SIZE;
+    this.canvas.height = OUTPUT_SIZE;
+    this.program = createProgram(gl, fragmentShader, vertexShader);
+    this.upscalePrograms = {
+      bilinear: createProgram(gl, bilinearShader),
+      lanczos2: createProgram(gl, lanczos2Shader),
+      fsr1: createProgram(gl, fsrEasuShader),
+      anime4k: createProgram(gl, anime4kShader)
+    };
+    this.finalProgram = createProgram(gl, finalShader);
 
     const buffer = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, -1,1, 1,-1, 1,1]), gl.STATIC_DRAW);
-    const position = gl.getAttribLocation(this.program, "a_position");
-    gl.enableVertexAttribArray(position);
-    gl.vertexAttribPointer(position, 2, gl.FLOAT, false, 0, 0);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
     this.videoTexture = this.createTexture(gl.LINEAR);
     this.maskTexture = this.createTexture(gl.LINEAR);
+    this.neuralTexture = this.createTexture(gl.LINEAR);
+    this.neuralUpscaler = new NeuralUpscaler(reportUpscaleStatus, this.reportFps);
+    this.neuralReadbackCanvas.width = this.neuralReadbackCanvas.height = INTERNAL_SIZE;
+    [this.relightTexture, this.relightFramebuffer] = this.createRenderTarget(INTERNAL_SIZE, gl.LINEAR);
+    [this.upscaleTexture, this.upscaleFramebuffer] = this.createRenderTarget(OUTPUT_SIZE, gl.NEAREST);
     gl.useProgram(this.program);
     gl.uniform1i(gl.getUniformLocation(this.program, "u_video"), 0);
     gl.uniform1i(gl.getUniformLocation(this.program, "u_mask"), 1);
+    Object.values(this.upscalePrograms).forEach((program) => {
+      gl.useProgram(program);
+      gl.uniform1i(gl.getUniformLocation(program, "u_src"), 0);
+    });
+    gl.useProgram(this.finalProgram);
+    gl.uniform1i(gl.getUniformLocation(this.finalProgram, "u_src"), 0);
   }
 
   private createTexture(filter: number) {
@@ -290,6 +597,23 @@ export class RelightRenderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, 1, 1, 0, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array([255]));
     return texture;
+  }
+
+  private createRenderTarget(size: number, filter: number) {
+    const { gl } = this;
+    const texture = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, size, size, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    const framebuffer = gl.createFramebuffer()!;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+    if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) throw new Error("Upscaling framebuffer is incomplete");
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return [texture, framebuffer] as const;
   }
 
   updateMask(mask: Uint8Array, width: number, height: number) {
@@ -310,12 +634,14 @@ export class RelightRenderer {
     const width = isVideo ? source.videoWidth : source.width;
     const height = isVideo ? source.videoHeight : source.height;
     if (!width || !height) return;
-    if (this.canvas.width !== width || this.canvas.height !== height) {
-      this.canvas.width = width;
-      this.canvas.height = height;
+    if (this.measuredMethod !== look.upscaleMethod) {
+      this.measuredMethod = look.upscaleMethod;
+      this.spatialFrameCount = 0;
+      this.spatialFpsStartedAt = performance.now();
     }
     const { gl } = this;
-    gl.viewport(0, 0, width, height);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.relightFramebuffer);
+    gl.viewport(0, 0, INTERNAL_SIZE, INTERNAL_SIZE);
     gl.useProgram(this.program);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.videoTexture);
@@ -351,9 +677,83 @@ export class RelightRenderer {
     gl.uniform2f(gl.getUniformLocation(this.program, "u_maskTexel"), 1 / this.maskWidth, 1 / this.maskHeight);
     const audioGain = look.audioReactive ? .6 + look.audioLevel * .75 + look.audioBeat * .85 : 1;
     gl.uniform1f(gl.getUniformLocation(this.program, "u_rimIntensity"), Math.min(1, look.rimIntensity * audioGain));
+    gl.uniform1f(gl.getUniformLocation(this.program, "u_showLight"), look.showLight ? 1 : 0);
+    gl.uniform2fv(gl.getUniformLocation(this.program, "u_lightPosition"), look.lightPosition);
     gl.uniform3fv(gl.getUniformLocation(this.program, "u_rimColor"), look.rimColor);
     gl.uniform1f(gl.getUniformLocation(this.program, "u_viewZoom"), this.viewZoom);
     gl.uniform2fv(gl.getUniformLocation(this.program, "u_viewCenter"), this.viewCenter);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    const neuralMethod = look.upscaleMethod === "websr" || look.upscaleMethod === "fsrcnn" ? look.upscaleMethod : undefined;
+    const spatialMethod: SpatialUpscaleMethod = neuralMethod ? "bilinear" : look.upscaleMethod as SpatialUpscaleMethod;
+    const upscaleProgram = this.upscalePrograms[spatialMethod];
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.upscaleFramebuffer);
+    gl.viewport(0, 0, OUTPUT_SIZE, OUTPUT_SIZE);
+    gl.useProgram(upscaleProgram);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.relightTexture);
+    gl.uniform2f(gl.getUniformLocation(upscaleProgram, "u_inSize"), INTERNAL_SIZE, INTERNAL_SIZE);
+    gl.uniform2f(gl.getUniformLocation(upscaleProgram, "u_outSize"), OUTPUT_SIZE, OUTPUT_SIZE);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, OUTPUT_SIZE, OUTPUT_SIZE);
+    gl.useProgram(this.finalProgram);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.upscaleTexture);
+    gl.uniform2f(gl.getUniformLocation(this.finalProgram, "u_size"), OUTPUT_SIZE, OUTPUT_SIZE);
+    gl.uniform1f(gl.getUniformLocation(this.finalProgram, "u_applyRcas"), look.rcasEnabled ? 1 : 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    if (neuralMethod) {
+      // Read the shared 320px working frame only when the async upscaler is
+      // ready for another request. This avoids both a per-frame GPU readback
+      // and an accidental baseline-upscale pass before neural inference.
+      this.neuralUpscaler.request(neuralMethod, () => this.captureNeuralInput());
+      const neuralResult = this.neuralUpscaler.getResult(neuralMethod);
+      if (neuralResult) this.drawNeuralResult(neuralResult, look.rcasEnabled);
+    } else {
+      this.measureSpatialFps(spatialMethod);
+    }
+  }
+
+  private measureSpatialFps(method: SpatialUpscaleMethod) {
+    this.spatialFrameCount++;
+    const now = performance.now();
+    const elapsed = now - this.spatialFpsStartedAt;
+    if (elapsed < 750) return;
+    this.reportFps(this.spatialFrameCount * 1000 / elapsed, method);
+    this.spatialFrameCount = 0;
+    this.spatialFpsStartedAt = now;
+  }
+
+  private captureNeuralInput() {
+    const { gl } = this;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.relightFramebuffer);
+    gl.readPixels(0, 0, INTERNAL_SIZE, INTERNAL_SIZE, gl.RGBA, gl.UNSIGNED_BYTE, this.neuralReadback);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    const pixels = new Uint8ClampedArray(
+      this.neuralReadback.buffer,
+      this.neuralReadback.byteOffset,
+      this.neuralReadback.byteLength
+    );
+    this.neuralReadbackContext.putImageData(new ImageData(pixels, INTERNAL_SIZE, INTERNAL_SIZE), 0, 0);
+    return this.neuralReadbackCanvas;
+  }
+
+  private drawNeuralResult(result: HTMLCanvasElement, applyRcas: boolean) {
+    const { gl } = this;
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.neuralTexture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, result);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, OUTPUT_SIZE, OUTPUT_SIZE);
+    gl.useProgram(this.finalProgram);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.neuralTexture);
+    gl.uniform2f(gl.getUniformLocation(this.finalProgram, "u_size"), result.width, result.height);
+    gl.uniform1f(gl.getUniformLocation(this.finalProgram, "u_applyRcas"), applyRcas ? 1 : 0);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
   }
 
