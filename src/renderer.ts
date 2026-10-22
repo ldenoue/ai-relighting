@@ -42,7 +42,7 @@ void main() {
   gl_Position = vec4(a_position, 0., 1.);
 }`;
 
-const postVertexShader = `#version 300 es
+export const upscaleVertexShader = `#version 300 es
 layout(location = 0) in vec2 a_position;
 out vec2 v_uv;
 void main() {
@@ -283,7 +283,7 @@ void main() {
   outColor = vec4(clamp(composite, 0., 1.), 1.);
 }`;
 
-const bilinearShader = `#version 300 es
+export const bilinearShader = `#version 300 es
 precision highp float;
 uniform sampler2D u_src;
 in vec2 v_uv;
@@ -291,7 +291,7 @@ out vec4 outColor;
 void main() { outColor = vec4(texture(u_src, v_uv).rgb, 1.); }
 `;
 
-const lanczos2Shader = `#version 300 es
+export const lanczos2Shader = `#version 300 es
 precision highp float;
 uniform sampler2D u_src;
 uniform vec2 u_inSize;
@@ -329,7 +329,7 @@ void main() {
 // AMD FidelityFX Super Resolution 1.0 EASU, adapted from the WebGL2
 // non-gather port in natureglass/Fsrlab. Its twelve-tap kernel follows local
 // edge direction, then clamps to the nearest four texels to suppress ringing.
-const fsrEasuShader = `#version 300 es
+export const fsrEasuShader = `#version 300 es
 precision highp float;
 precision highp int;
 uniform sampler2D u_src;
@@ -428,7 +428,7 @@ void main() {
 // Lightweight browser port of Anime4K v3.2 Original's edge refinement.
 // The official shader derives a Sobel direction and pulls edge pixels along
 // that direction; this fused pass performs the same operation after scaling.
-const anime4kShader = `#version 300 es
+export const anime4kShader = `#version 300 es
 precision highp float;
 uniform sampler2D u_src;
 uniform vec2 u_inSize;
@@ -461,7 +461,7 @@ void main() {
   outColor=vec4(clamp(mix(base,mix(yValue,xValue,ratio),refine),0.,1.),1.);
 }`;
 
-const finalShader = `#version 300 es
+export const finalShader = `#version 300 es
 precision highp float;
 precision highp int;
 uniform sampler2D u_src;
@@ -499,7 +499,7 @@ function compile(gl: WebGL2RenderingContext, type: number, source: string) {
   return shader;
 }
 
-function createProgram(gl: WebGL2RenderingContext, fragmentSource: string, vertexSource = postVertexShader) {
+function createProgram(gl: WebGL2RenderingContext, fragmentSource: string, vertexSource = upscaleVertexShader) {
   const program = gl.createProgram()!;
   gl.attachShader(program, compile(gl, gl.VERTEX_SHADER, vertexSource));
   gl.attachShader(program, compile(gl, gl.FRAGMENT_SHADER, fragmentSource));

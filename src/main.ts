@@ -126,7 +126,7 @@ const videoSessionStore = new VideoSessionStore();
 document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
   <main class="app-shell">
     <header class="topbar">
-      <div class="brand"><span class="brand-mark">◒</span> Relight Lab</div>
+      <div class="brand"><span class="brand-mark">◒</span> Relight Lab <a class="upscaling-link" href="./upscaling.html">Upscaling lab</a></div>
       <div class="music-search-shell">
         <form class="music-search" id="music-search-form">
           <input id="music-search-input" type="search" placeholder="Search Apple Music" aria-label="Search Apple Music" autocomplete="off">
