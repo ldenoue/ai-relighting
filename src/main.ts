@@ -1,9 +1,13 @@
 import { FilesetResolver, ImageSegmenter, type ImageSegmenterResult } from "@mediapipe/tasks-vision";
 import { RelightRenderer, type Look, type UpscaleMethod } from "./renderer";
+import { RvmSegmenter, type RvmMatte } from "./rvm-segmenter";
 import "./style.css";
 
 const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite";
 const WASM_URL = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22-rc.20250304/wasm";
+type SegmentationMethod = "mediapipe" | "rvm";
+let segmentationMethod: SegmentationMethod = "rvm";
+let autoFrameEnabled = true;
 
 const state: Look = {
   autoAdjust: true,
@@ -13,6 +17,7 @@ const state: Look = {
   warmth: 0,
   contrast: 1,
   isolate: true,
+  matteThreshold: .12,
   labTransfer: true,
   referenceStrength: 0,
   referencePersonMean: [.5, .5, .5],
@@ -141,6 +146,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
     <div class="toggle-row">
       <label class="toggle"><input id="auto-adjust" type="checkbox" checked><span class="switch"></span>Auto adjustments</label>
       <label class="toggle"><input id="isolate" type="checkbox" checked><span class="switch"></span>Isolate people</label>
+      <label class="toggle" title="Center and scale each detected person to roughly 80% of the frame"><input id="auto-frame" type="checkbox" checked><span class="switch"></span>Auto frame</label>
       <label class="toggle"><input id="reference-background" type="checkbox" checked><span class="switch"></span>Reference background</label>
       <label class="toggle" title="Hide the visible halo while keeping its illumination on the subject"><input id="show-light" type="checkbox" checked><span class="switch"></span>Visible light</label>
       <label class="toggle" title="Apply AMD RCAS sharpening after the selected upscaler"><input id="rcas" type="checkbox" checked><span class="switch"></span>RCAS</label>
@@ -149,6 +155,20 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <button type="button" data-shape="square" aria-pressed="false">Square</button>
         <button class="active" type="button" data-shape="portrait" aria-pressed="true">Portrait</button>
       </div>
+    </div>
+    <div class="processing-row">
+      <label class="upscale-control" for="segmentation-method">
+        <span>Matte</span>
+        <select id="segmentation-method">
+          <option value="mediapipe">MediaPipe 256</option>
+          <option value="rvm" selected>RVM MobileNetV3</option>
+        </select>
+      </label>
+      <label class="matte-control" for="matte-threshold" title="Lower values include less-confident person pixels; higher values remove them">
+        <span>Matte cutoff</span>
+        <input id="matte-threshold" type="range" min="0" max="80" value="12" step="1">
+        <output id="matte-threshold-output" for="matte-threshold">12%</output>
+      </label>
       <label class="upscale-control" for="upscale-method">
         <span>Upscale</span>
         <select id="upscale-method">
@@ -166,17 +186,17 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <label for="rim-intensity">Light</label>
         <input id="rim-intensity" type="range" min="0" max="100" value="40" step="1">
         <input id="rim-color" type="color" value="#8edcff" aria-label="Backlight color">
-        <button class="light-position-pad" id="light-position-pad" type="button" aria-label="Backlight position" aria-valuetext="50% horizontal, 35% vertical" title="Drag to position the light">
-          <span class="light-position-marker" aria-hidden="true"></span>
-        </button>
         <output id="rim-color-output" for="rim-color" hidden>#8edcff</output>
       </div>
+      <button class="light-position-pad" id="light-position-pad" data-shape="portrait" type="button" aria-label="Backlight position" aria-valuetext="50% horizontal, 35% vertical" title="Drag to position the light">
+        <span class="light-position-marker" aria-hidden="true"></span>
+      </button>
+      <section class="reference-strip drop-target" id="reference-strip" role="button" tabindex="0" aria-label="Choose or drop a reference image" title="Click or drop a reference image here" hidden>
+        <img class="reference-thumb" id="reference-thumb" alt="Lighting reference">
+        <div class="reference-copy"><span class="reference-label">Reference look</span><strong id="reference-name"></strong><span id="reference-stats">Analyzing reference…</span></div>
+        <button class="remove" id="reset-reference" title="Restore default reference" aria-label="Restore default reference">✕</button>
+      </section>
     </div>
-    <section class="reference-strip drop-target" id="reference-strip" role="button" tabindex="0" aria-label="Choose or drop a reference image" title="Click or drop a reference image here" hidden>
-      <img class="reference-thumb" id="reference-thumb" alt="Lighting reference">
-      <div class="reference-copy"><span class="reference-label">Reference look</span><strong id="reference-name"></strong><span id="reference-stats">Analyzing reference…</span></div>
-      <button class="remove" id="reset-reference" title="Restore default reference" aria-label="Restore default reference">✕</button>
-    </section>
     <section class="grid" id="grid" data-tile-shape="portrait">
       <div class="add-video-tile drop-target" id="add-video-tile" role="button" tabindex="0" aria-label="Add videos">
         <span class="add-video-icon">＋</span>
@@ -252,6 +272,56 @@ class SegmenterPool {
       console.error(error);
     } finally {
       this.lastRun = performance.now();
+      this.busy = false;
+      void this.drain();
+    }
+  }
+}
+
+class RvmSegmenterPool {
+  private model = new RvmSegmenter();
+  private busy = false;
+  private queue: VideoSource[] = [];
+  private queued = new Set<VideoSource>();
+
+  load() {
+    return this.model.load();
+  }
+
+  request(source: VideoSource) {
+    if (!state.isolate || segmentationMethod !== "rvm" || this.queued.has(source)) return;
+    this.queue.push(source);
+    this.queued.add(source);
+    void this.drain();
+  }
+
+  remove(source: VideoSource) {
+    this.queued.delete(source);
+    this.queue = this.queue.filter((item) => item !== source);
+    this.model.reset(source);
+  }
+
+  reset(source: VideoSource) {
+    this.model.reset(source);
+  }
+
+  private async drain() {
+    if (this.busy || !state.isolate || segmentationMethod !== "rvm" || !this.queue.length) return;
+    const source = this.queue.shift()!;
+    this.queued.delete(source);
+    if (!source.active || source.video.readyState < 2) {
+      void this.drain();
+      return;
+    }
+    this.busy = true;
+    try {
+      const frame = source.captureSegmentationFrame();
+      if (!frame) return;
+      source.acceptMatte(await this.model.segment(source, frame));
+    } catch (error) {
+      console.error("RVM inference failed", error);
+      setModelStatus("RVM unavailable; select MediaPipe to continue");
+    } finally {
       this.busy = false;
       void this.drain();
     }
@@ -463,6 +533,7 @@ class ReferenceAnalyzer {
 }
 
 const segmenter = new SegmenterPool();
+const rvmSegmenter = new RvmSegmenterPool();
 const referenceAnalyzer = new ReferenceAnalyzer();
 const sources: VideoSource[] = [];
 
@@ -530,6 +601,7 @@ class VideoSource {
       (fps, method) => this.acceptStageFps(fps, method)
     );
     this.video.addEventListener("loadeddata", () => this.video.play().catch(() => {}));
+    this.video.addEventListener("seeked", () => rvmSegmenter.reset(this));
     this.tick();
   }
 
@@ -560,9 +632,16 @@ class VideoSource {
       this.captureSegmentationFrame();
       this.renderer.render(this.pendingFrame, state, true);
     }
-    if (performance.now() - this.lastAnalysis > 120) {
+    // Feed either matte backend at the same cadence. MediaPipe's shared pool
+    // already caps total inference near 30 fps and RVM serializes its own
+    // requests, so a slower per-source gate only hides their real throughput.
+    const analysisInterval = state.isolate ? 30 : 120;
+    if (performance.now() - this.lastAnalysis > analysisInterval) {
       this.lastAnalysis = performance.now();
-      if (state.isolate) segmenter.request(this);
+      if (state.isolate) {
+        if (segmentationMethod === "rvm") rvmSegmenter.request(this);
+        else segmenter.request(this);
+      }
       else this.updateGlobalExposure();
     }
     requestAnimationFrame(this.tick);
@@ -602,6 +681,10 @@ class VideoSource {
   acceptSegmentation(result: ImageSegmenterResult) {
     const matte = extractPersonMatte(result);
     if (!matte) return;
+    this.acceptMatte(matte);
+  }
+
+  acceptMatte(matte: RvmMatte) {
     if (this.pairedFrame.width !== this.pendingFrame.width || this.pairedFrame.height !== this.pendingFrame.height) {
       this.pairedFrame.width = this.pendingFrame.width;
       this.pairedFrame.height = this.pendingFrame.height;
@@ -610,7 +693,14 @@ class VideoSource {
     }
     this.pairedCtx.drawImage(this.pendingFrame, 0, 0);
     const alpha = this.renderer.updateMask(matte.alpha, matte.width, matte.height);
-    this.renderer.updateFraming(alpha, matte.width, matte.height);
+    if (autoFrameEnabled) {
+      const isRvm = segmentationMethod === "rvm";
+      // RVM can assign much less confidence to the body than the face. Frame
+      // from those faint pixels too, and never let a partial RVM matte trigger
+      // the aggressive 4x crop that is useful for MediaPipe's firmer mask.
+      const framingThreshold = isRvm ? Math.max(.01, state.matteThreshold) : .44;
+      this.renderer.updateFraming(alpha, matte.width, matte.height, framingThreshold, isRvm ? 1.8 : 4);
+    }
     this.hasPairedFrame = true;
     this.sourceTextureDirty = true;
     this.updateExposure(alpha, matte.width, matte.height);
@@ -647,6 +737,10 @@ class VideoSource {
     this.stageFps.clear();
     this.segmentationFps = 0;
     this.lastSegmentationCompletedAt = 0;
+  }
+
+  resetFraming() {
+    this.renderer.resetFraming();
   }
 
   private updateExposure(mask: Uint8Array, width: number, height: number) {
@@ -714,6 +808,7 @@ class VideoSource {
   remove() {
     this.active = false;
     segmenter.remove(this);
+    rvmSegmenter.remove(this);
     this.card.remove();
     this.video.pause();
     this.stream?.getTracks().forEach((track) => track.stop());
@@ -998,8 +1093,17 @@ document.querySelector<HTMLInputElement>("#auto-adjust")!.addEventListener("chan
 document.querySelector<HTMLInputElement>("#isolate")!.addEventListener("change", (event) => {
   state.isolate = (event.target as HTMLInputElement).checked;
   document.querySelector<HTMLOutputElement>("#fps-status")!.value = "FPS …";
-  sources.forEach((source) => source.resetPerformanceMeter());
-  if (state.isolate) void segmenter.load();
+  sources.forEach((source) => {
+    segmenter.remove(source);
+    rvmSegmenter.remove(source);
+    source.resetPerformanceMeter();
+    source.resetFraming();
+  });
+  if (state.isolate) void (segmentationMethod === "rvm" ? rvmSegmenter.load() : segmenter.load());
+});
+document.querySelector<HTMLInputElement>("#auto-frame")!.addEventListener("change", (event) => {
+  autoFrameEnabled = (event.target as HTMLInputElement).checked;
+  if (!autoFrameEnabled) sources.forEach((source) => source.resetFraming());
 });
 document.querySelector<HTMLInputElement>("#reference-background")!.addEventListener("change", (event) => {
   state.replaceBackground = (event.target as HTMLInputElement).checked;
@@ -1014,6 +1118,7 @@ document.querySelectorAll<HTMLButtonElement>("[data-shape]").forEach((button) =>
   button.addEventListener("click", () => {
     const shape = button.dataset.shape === "portrait" ? "portrait" : "square";
     document.querySelector<HTMLElement>("#grid")!.dataset.tileShape = shape;
+    document.querySelector<HTMLButtonElement>("#light-position-pad")!.dataset.shape = shape;
     document.querySelectorAll<HTMLButtonElement>("[data-shape]").forEach((item) => {
       const active = item.dataset.shape === shape;
       item.classList.toggle("active", active);
@@ -1027,6 +1132,23 @@ document.querySelector<HTMLSelectElement>("#upscale-method")!.addEventListener("
   sources.forEach((source) => source.resetPerformanceMeter());
   const neural = state.upscaleMethod === "websr" || state.upscaleMethod === "fsrcnn";
   setUpscaleStatus(neural ? (navigator.gpu ? "Preparing WebGPU…" : "WebGPU unavailable") : "320→640", neural && !navigator.gpu);
+});
+document.querySelector<HTMLSelectElement>("#segmentation-method")!.addEventListener("change", (event) => {
+  segmentationMethod = (event.target as HTMLSelectElement).value as SegmentationMethod;
+  document.querySelector<HTMLOutputElement>("#fps-status")!.value = "FPS …";
+  sources.forEach((source) => {
+    segmenter.remove(source);
+    rvmSegmenter.remove(source);
+    source.resetPerformanceMeter();
+    source.resetFraming();
+  });
+  if (state.isolate) void (segmentationMethod === "rvm" ? rvmSegmenter.load() : segmenter.load());
+});
+const matteThreshold = document.querySelector<HTMLInputElement>("#matte-threshold")!;
+matteThreshold.addEventListener("input", () => {
+  state.matteThreshold = Number(matteThreshold.value) / 100;
+  document.querySelector<HTMLOutputElement>("#matte-threshold-output")!.value = `${matteThreshold.value}%`;
+  if (autoFrameEnabled) sources.forEach((source) => source.resetFraming());
 });
 const rimSlider = document.querySelector<HTMLInputElement>("#rim-intensity")!;
 const beginManualRimControl = () => {
@@ -1212,6 +1334,6 @@ async function loadDefaultReference() {
   }
 }
 
-void segmenter.load();
+void rvmSegmenter.load();
 void loadDefaultReference();
 void restoreSessionVideos();

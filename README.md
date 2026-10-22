@@ -8,7 +8,7 @@ A browser-only experiment that makes uploaded videos and webcam feeds feel as th
 
 ## What it does
 
-- Runs MediaPipe Selfie Multiclass Segmentation at 256 × 256 while retaining a synchronized high-resolution source snapshot.
+- Lets you compare MediaPipe Selfie Multiclass Segmentation with recurrent RVM MobileNetV3 matting, both at 256 × 256, while retaining a synchronized high-resolution source snapshot.
 - Derives the model input from that high-resolution snapshot and pairs each result back to the same frame, avoiding both mask lag and zoomed 256-pixel video.
 - Letterboxes sources before processing and automatically frames each person to roughly 80% of the tile height.
 - Transfers person and background color statistics from a reference image.
@@ -24,7 +24,7 @@ A browser-only experiment that makes uploaded videos and webcam feeds feel as th
 ## How the pipeline works
 
 1. Each local video or webcam is decoded once into a high-resolution square snapshot; a 256 × 256 copy is derived from it for inference.
-2. A shared MediaPipe model produces a soft person confidence matte that stays paired with the original high-resolution snapshot.
+2. The selected matte model produces a soft person alpha mask paired with the original high-resolution snapshot. MediaPipe uses inverted background confidence; RVM carries four recurrent tensors per video for temporally stable hair and edge detail.
 3. A GPU filter refines the matte, and a smoothed view transform normalizes subject framing.
 4. Foreground luminance is measured and temporally stabilized to avoid exposure pumping.
 5. A separate reference-image pass measures foreground/background RGB distributions and finds the dominant backdrop color.
@@ -34,6 +34,8 @@ A browser-only experiment that makes uploaded videos and webcam feeds feel as th
 All six choices intentionally share one 320 × 320 input and produce a 640 × 640 result. **FSR 1.0** is the default and uses EASU's edge-directed 12-tap reconstruction; **Bilinear** is the browser baseline; **Lanczos2** uses a 16-tap kernel; **Anime4K Original** uses lightweight Sobel-guided line refinement; **WebSR CNN-S** runs the small Anime4K real-life CNN with WebGPU. **FSRCNN ×2** runs a luminance model through ONNX Runtime WebGPU and keeps chroma from a conventional resize. The independent **RCAS** toggle optionally applies the same final sharpening pass after any selected method.
 
 The neural options load their runtimes and weights only when selected and display the latest completed result while the next frame is inferred. They require WebGPU; unsupported browsers keep showing the bilinear fallback. The first FSRCNN use downloads the roughly 24 MB ONNX Runtime WASM support module in addition to the 37 KB model. Implementations, model provenance, and licenses are recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+The **Matte** picker defaults to RVM MobileNetV3, which loads a bundled 14 MB FP32 ONNX model and runs through ONNX Runtime's SIMD WASM backend. The official ONNX graph produces corrupt sparse alpha patches with the current browser WebGPU provider, so correctness currently takes priority over GPU throughput. RVM processes the same 256 × 256 frame at full internal resolution and maintains independent recurrent state for each video. MediaPipe remains available in the picker and continues to analyze static reference images because RVM's temporal memory provides no advantage for a single image. **Matte cutoff** remaps confidence through a soft 35-point transition—lower values recover conservative RVM pixels without creating a binary edge. The independent **Auto frame** toggle can disable the mask-derived 80%-height centering and immediately restore an identity view. RVM framing measures the same faint pixels admitted by that cutoff and caps automatic zoom at 1.8×, preventing a confident face patch from causing a face-only 4× crop.
 
 The standalone **Upscaling Lab** accepts a local image by picker or drag-and-drop. It creates 5%, 10%, 25%, 50%, 75%, or 100% inputs relative to a fixed 512px output target while preserving aspect ratio, then reconstructs every result with the same four spatial shaders and two neural models used by the video pipeline. Each card reports elapsed time and can export its result as a PNG; RCAS can be applied consistently across all six methods.
 
@@ -47,7 +49,7 @@ Apple publishes these clips as promotional previews and its terms restrict synch
 
 ## Run locally
 
-Requirements: a modern browser with WebGL 2 and Node.js 20 or newer. WebGPU is additionally required for WebSR and FSRCNN.
+Requirements: a modern browser with WebGL 2 and Node.js 20 or newer. WebGPU is additionally required for WebSR and FSRCNN. RVM currently uses SIMD WASM for correct recurrent inference.
 
 ```sh
 npm install

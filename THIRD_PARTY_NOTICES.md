@@ -41,3 +41,9 @@ THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR I
 `public/models/fsrcnn-x2-320.onnx` is a browser-targeted ONNX conversion of the ×2 TensorFlow model from [Saafke/FSRCNN_Tensorflow](https://github.com/Saafke/FSRCNN_Tensorflow). It was converted from the original fixed graph to a fixed 320 × 320 luminance input and 640 × 640 output; the weights were not retrained. The source project is distributed under Apache License 2.0. A copy is included at [licenses/FSRCNN-APACHE-2.0.txt](licenses/FSRCNN-APACHE-2.0.txt).
 
 FSRCNN inference uses [Microsoft ONNX Runtime Web](https://github.com/microsoft/onnxruntime), distributed under the MIT License.
+
+## Robust Video Matting
+
+`public/models/rvm-mobilenetv3-fp32.onnx` is the official MobileNetV3 FP32 ONNX export from [PeterL1n/RobustVideoMatting](https://github.com/PeterL1n/RobustVideoMatting). It is used at 256 × 256 at full internal resolution through Microsoft ONNX Runtime Web's WASM execution provider.
+
+Robust Video Matting was developed at ByteDance Inc. by Shanchuan Lin, Linjie Yang, Imran Saleemi, and Soumyadip Sengupta. The upstream project was re-released under the GNU General Public License v3.0. A copy is included at [licenses/RVM-GPL-3.0.txt](licenses/RVM-GPL-3.0.txt). Distribution of this model therefore introduces GPL-3.0 obligations; review compatibility with the intended distribution model before treating this prototype as a proprietary product.

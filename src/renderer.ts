@@ -11,6 +11,7 @@ export type Look = {
   warmth: number;
   contrast: number;
   isolate: boolean;
+  matteThreshold: number;
   labTransfer: boolean;
   referenceStrength: number;
   referencePersonMean: [number, number, number];
@@ -60,6 +61,7 @@ uniform float u_backgroundEv;
 uniform float u_warmth;
 uniform float u_contrast;
 uniform float u_isolate;
+uniform float u_matteThreshold;
 uniform float u_labTransfer;
 uniform float u_referenceStrength;
 uniform vec3 u_sourcePersonMean;
@@ -184,7 +186,10 @@ void main() {
   // and the optical occlusion term: opaque pixels block the source, while
   // uncertain hair/edge pixels transmit part of the light behind them.
   float matteAlpha = clamp(softMask, 0., 1.);
-  float person = mix(1., smoothstep(.12, .88, matteAlpha), u_isolate);
+  // Turn model confidence into a useful but still feathered person alpha.
+  // Lower thresholds recover conservative mattes such as RVM; the fixed
+  // transition width avoids the hard cardboard edge of a binary cutoff.
+  float person = mix(1., smoothstep(u_matteThreshold, min(.99, u_matteThreshold + .35), matteAlpha), u_isolate);
   vec3 foregroundRgb = transferLook(source, u_sourcePersonMean, u_sourcePersonStd, u_referencePersonMean, u_referencePersonStd, 1.);
   vec3 backgroundRgb = transferLook(source, u_sourceBackgroundMean, u_sourceBackgroundStd, u_referenceBackgroundMean, u_referenceBackgroundStd, 0.);
   float labAmount = u_labTransfer * step(.001, u_referenceStrength);
@@ -654,6 +659,7 @@ export class RelightRenderer {
     gl.uniform1f(gl.getUniformLocation(this.program, "u_warmth"), look.autoAdjust ? look.warmth : 0);
     gl.uniform1f(gl.getUniformLocation(this.program, "u_contrast"), look.autoAdjust ? look.contrast : 1);
     gl.uniform1f(gl.getUniformLocation(this.program, "u_isolate"), look.isolate ? 1 : 0);
+    gl.uniform1f(gl.getUniformLocation(this.program, "u_matteThreshold"), look.matteThreshold);
     gl.uniform1f(gl.getUniformLocation(this.program, "u_labTransfer"), look.labTransfer && look.autoAdjust ? 1 : 0);
     gl.uniform1f(gl.getUniformLocation(this.program, "u_referenceStrength"), look.autoAdjust ? look.referenceStrength : 0);
     gl.uniform3fv(gl.getUniformLocation(this.program, "u_sourcePersonMean"), this.sourcePersonMean);
@@ -757,7 +763,7 @@ export class RelightRenderer {
     gl.drawArrays(gl.TRIANGLES, 0, 6);
   }
 
-  updateFraming(mask: Uint8Array, width: number, height: number) {
+  updateFraming(mask: Uint8Array, width: number, height: number, threshold = .44, maxZoom = 4) {
     let minX = width;
     let minY = height;
     let maxX = -1;
@@ -765,7 +771,7 @@ export class RelightRenderer {
     let count = 0;
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < width; x++) {
-        if (mask[y * width + x] < 112) continue;
+        if (mask[y * width + x] < Math.round(Math.min(.95, threshold) * 255)) continue;
         minX = Math.min(minX, x);
         maxX = Math.max(maxX, x);
         minY = Math.min(minY, y);
@@ -775,7 +781,7 @@ export class RelightRenderer {
     }
     if (count < 80 || maxY <= minY) return;
     const personHeight = (maxY - minY + 1) / height;
-    const targetZoom = Math.max(.65, Math.min(4, .8 / personHeight));
+    const targetZoom = Math.max(.65, Math.min(maxZoom, .8 / personHeight));
     const targetCenter: [number, number] = [
       (minX + maxX + 1) / (2 * width),
       (minY + maxY + 1) / (2 * height)
@@ -789,6 +795,12 @@ export class RelightRenderer {
     this.viewZoom += (targetZoom - this.viewZoom) * .08;
     this.viewCenter[0] += (targetCenter[0] - this.viewCenter[0]) * .14;
     this.viewCenter[1] += (targetCenter[1] - this.viewCenter[1]) * .14;
+  }
+
+  resetFraming() {
+    this.viewZoom = 1;
+    this.viewCenter = [.5, .5];
+    this.framingInitialized = false;
   }
 
   get maskSize() { return [this.maskWidth, this.maskHeight] as const; }
