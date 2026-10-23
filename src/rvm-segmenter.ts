@@ -21,9 +21,6 @@ async function resources() {
   ort.env.wasm.wasmPaths = { wasm: new URL(ortWasmUrl, location.href).href };
   ort.env.wasm.numThreads = 1;
   sessionPromise ??= ort.InferenceSession.create(MODEL_URL, {
-    // The official export is validated for ONNX Runtime CPU/CUDA. ORT WebGPU
-    // currently returns corrupt sparse alpha patches for RVM's recurrent
-    // graph, so prefer its SIMD WASM CPU backend until that path is reliable.
     executionProviders: ["wasm"],
     graphOptimizationLevel: "all",
     executionMode: "sequential",

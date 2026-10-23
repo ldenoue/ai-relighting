@@ -10,8 +10,10 @@
   },
   "dependencies": {
     "@mediapipe/tasks-vision": "^0.10.22-rc.20250304",
+    "@tensorflow/tfjs": "^4.22.0",
+    "@tensorflow/tfjs-backend-webgpu": "^4.22.0",
     "@websr/websr": "^0.0.16",
-    "onnxruntime-web": "1.23.2"
+    "onnxruntime-web": "^1.27.0"
   },
   "devDependencies": {
     "@webgpu/types": "^0.1.68",

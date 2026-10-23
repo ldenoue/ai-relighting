@@ -1,13 +1,17 @@
 import { FilesetResolver, ImageSegmenter, type ImageSegmenterResult } from "@mediapipe/tasks-vision";
 import { RelightRenderer, type Look, type UpscaleMethod } from "./renderer";
 import { RvmSegmenter, type RvmMatte } from "./rvm-segmenter";
+import { RvmTfjsSegmenter } from "./rvm-tfjs-segmenter";
 import "./style.css";
 
 const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite";
 const WASM_URL = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22-rc.20250304/wasm";
-type SegmentationMethod = "mediapipe" | "rvm";
-let segmentationMethod: SegmentationMethod = "rvm";
+type SegmentationMethod = "mediapipe" | "rvm-wasm" | "rvm-webgpu";
+let segmentationMethod: SegmentationMethod = navigator.gpu ? "rvm-webgpu" : "rvm-wasm";
 let autoFrameEnabled = true;
+
+const isRvmMethod = (method: SegmentationMethod): method is Exclude<SegmentationMethod, "mediapipe"> => method !== "mediapipe";
+const rvmProvider = (method: Exclude<SegmentationMethod, "mediapipe">) => method === "rvm-webgpu" ? "webgpu" : "wasm";
 
 const state: Look = {
   autoAdjust: true,
@@ -161,7 +165,8 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <span>Matte</span>
         <select id="segmentation-method">
           <option value="mediapipe">MediaPipe 256</option>
-          <option value="rvm" selected>RVM MobileNetV3</option>
+          <option value="rvm-wasm" ${segmentationMethod === "rvm-wasm" ? "selected" : ""}>RVM · WASM</option>
+          <option value="rvm-webgpu" ${segmentationMethod === "rvm-webgpu" ? "selected" : ""} ${navigator.gpu ? "" : "disabled"}>RVM · WebGPU (TF.js)</option>
         </select>
       </label>
       <label class="matte-control" for="matte-threshold" title="Lower values include less-confident person pixels; higher values remove them">
@@ -181,7 +186,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         </select>
       </label>
       <output class="upscale-status" id="upscale-status" aria-live="polite">320→640</output>
-      <output class="fps-status" id="fps-status" title="End-to-end per-tile throughput, including MediaPipe and the selected upscaler" aria-live="polite">FPS —</output>
+      <output class="fps-status" id="fps-status" title="End-to-end per-tile throughput, including the selected matte model and upscaler" aria-live="polite">FPS —</output>
       <div class="backlight-compact" title="Music drives this slider while playing; drag it for temporary manual control">
         <label for="rim-intensity">Light</label>
         <input id="rim-intensity" type="range" min="0" max="100" value="40" step="1">
@@ -211,7 +216,6 @@ class SegmenterPool {
   private model?: ImageSegmenter;
   private loading?: Promise<ImageSegmenter>;
   private busy = false;
-  private lastRun = 0;
   private queue: VideoSource[] = [];
   private queued = new Set<VideoSource>();
 
@@ -249,13 +253,6 @@ class SegmenterPool {
 
   private async drain() {
     if (this.busy || !state.isolate || !this.queue.length) return;
-    // Cap the shared model near 30 fps. With several sources this budget is
-    // distributed round-robin, while every rendered mask remains frame-locked.
-    const wait = Math.max(0, 33 - (performance.now() - this.lastRun));
-    if (wait > 0) {
-      window.setTimeout(() => void this.drain(), wait);
-      return;
-    }
     const source = this.queue.shift()!;
     this.queued.delete(source);
     if (!source.active || source.video.readyState < 2) {
@@ -271,7 +268,6 @@ class SegmenterPool {
     } catch (error) {
       console.error(error);
     } finally {
-      this.lastRun = performance.now();
       this.busy = false;
       void this.drain();
     }
@@ -279,17 +275,31 @@ class SegmenterPool {
 }
 
 class RvmSegmenterPool {
-  private model = new RvmSegmenter();
+  private models = {
+    wasm: new RvmSegmenter(),
+    webgpu: new RvmTfjsSegmenter()
+  };
   private busy = false;
   private queue: VideoSource[] = [];
   private queued = new Set<VideoSource>();
 
-  load() {
-    return this.model.load();
+  async load() {
+    if (!isRvmMethod(segmentationMethod)) return Promise.resolve();
+    const method = segmentationMethod;
+    try {
+      await this.models[rvmProvider(method)].load();
+    } catch (error) {
+      if (method !== "rvm-webgpu" || segmentationMethod !== method) throw error;
+      console.warn("RVM WebGPU initialization failed; falling back to WASM", error);
+      segmentationMethod = "rvm-wasm";
+      document.querySelector<HTMLSelectElement>("#segmentation-method")!.value = segmentationMethod;
+      setModelStatus("RVM WebGPU unavailable; using WASM");
+      await this.models.wasm.load();
+    }
   }
 
   request(source: VideoSource) {
-    if (!state.isolate || segmentationMethod !== "rvm" || this.queued.has(source)) return;
+    if (!state.isolate || !isRvmMethod(segmentationMethod) || this.queued.has(source)) return;
     this.queue.push(source);
     this.queued.add(source);
     void this.drain();
@@ -298,15 +308,17 @@ class RvmSegmenterPool {
   remove(source: VideoSource) {
     this.queued.delete(source);
     this.queue = this.queue.filter((item) => item !== source);
-    this.model.reset(source);
+    this.models.wasm.reset(source);
+    this.models.webgpu.reset(source);
   }
 
   reset(source: VideoSource) {
-    this.model.reset(source);
+    this.models.wasm.reset(source);
+    this.models.webgpu.reset(source);
   }
 
   private async drain() {
-    if (this.busy || !state.isolate || segmentationMethod !== "rvm" || !this.queue.length) return;
+    if (this.busy || !state.isolate || !isRvmMethod(segmentationMethod) || !this.queue.length) return;
     const source = this.queue.shift()!;
     this.queued.delete(source);
     if (!source.active || source.video.readyState < 2) {
@@ -317,10 +329,20 @@ class RvmSegmenterPool {
     try {
       const frame = source.captureSegmentationFrame();
       if (!frame) return;
-      source.acceptMatte(await this.model.segment(source, frame));
+      const method = segmentationMethod;
+      if (!isRvmMethod(method)) return;
+      source.acceptMatte(await this.models[rvmProvider(method)].segment(source, frame));
     } catch (error) {
       console.error("RVM inference failed", error);
-      setModelStatus("RVM unavailable; select MediaPipe to continue");
+      if (segmentationMethod === "rvm-webgpu") {
+        segmentationMethod = "rvm-wasm";
+        document.querySelector<HTMLSelectElement>("#segmentation-method")!.value = segmentationMethod;
+        this.models.webgpu.reset(source);
+        setModelStatus("RVM WebGPU unavailable; using WASM");
+        void this.models.wasm.load();
+      } else {
+        setModelStatus("RVM unavailable; select MediaPipe to continue");
+      }
     } finally {
       this.busy = false;
       void this.drain();
@@ -632,17 +654,14 @@ class VideoSource {
       this.captureSegmentationFrame();
       this.renderer.render(this.pendingFrame, state, true);
     }
-    // Feed either matte backend at the same cadence. MediaPipe's shared pool
-    // already caps total inference near 30 fps and RVM serializes its own
-    // requests, so a slower per-source gate only hides their real throughput.
-    const analysisInterval = state.isolate ? 30 : 120;
-    if (performance.now() - this.lastAnalysis > analysisInterval) {
+    // Request a new matte every animation frame. Each backend's single-flight
+    // queue provides its only limit, exposing its actual maximum throughput.
+    if (state.isolate) {
+      if (isRvmMethod(segmentationMethod)) rvmSegmenter.request(this);
+      else segmenter.request(this);
+    } else if (performance.now() - this.lastAnalysis > 120) {
       this.lastAnalysis = performance.now();
-      if (state.isolate) {
-        if (segmentationMethod === "rvm") rvmSegmenter.request(this);
-        else segmenter.request(this);
-      }
-      else this.updateGlobalExposure();
+      this.updateGlobalExposure();
     }
     requestAnimationFrame(this.tick);
   };
@@ -694,7 +713,7 @@ class VideoSource {
     this.pairedCtx.drawImage(this.pendingFrame, 0, 0);
     const alpha = this.renderer.updateMask(matte.alpha, matte.width, matte.height);
     if (autoFrameEnabled) {
-      const isRvm = segmentationMethod === "rvm";
+      const isRvm = isRvmMethod(segmentationMethod);
       // RVM can assign much less confidence to the body than the face. Frame
       // from those faint pixels too, and never let a partial RVM matte trigger
       // the aggressive 4x crop that is useful for MediaPipe's firmer mask.
@@ -1099,7 +1118,7 @@ document.querySelector<HTMLInputElement>("#isolate")!.addEventListener("change",
     source.resetPerformanceMeter();
     source.resetFraming();
   });
-  if (state.isolate) void (segmentationMethod === "rvm" ? rvmSegmenter.load() : segmenter.load());
+  if (state.isolate) void (isRvmMethod(segmentationMethod) ? rvmSegmenter.load() : segmenter.load());
 });
 document.querySelector<HTMLInputElement>("#auto-frame")!.addEventListener("change", (event) => {
   autoFrameEnabled = (event.target as HTMLInputElement).checked;
@@ -1142,7 +1161,7 @@ document.querySelector<HTMLSelectElement>("#segmentation-method")!.addEventListe
     source.resetPerformanceMeter();
     source.resetFraming();
   });
-  if (state.isolate) void (segmentationMethod === "rvm" ? rvmSegmenter.load() : segmenter.load());
+  if (state.isolate) void (isRvmMethod(segmentationMethod) ? rvmSegmenter.load() : segmenter.load());
 });
 const matteThreshold = document.querySelector<HTMLInputElement>("#matte-threshold")!;
 matteThreshold.addEventListener("input", () => {
