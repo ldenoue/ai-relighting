@@ -2,16 +2,23 @@ import { FilesetResolver, ImageSegmenter, type ImageSegmenterResult } from "@med
 import { RelightRenderer, type Look, type UpscaleMethod } from "./renderer";
 import { RvmSegmenter, type RvmMatte } from "./rvm-segmenter";
 import { RvmTfjsSegmenter } from "./rvm-tfjs-segmenter";
+import { RvmLiteRtSegmenter } from "./rvm-litert-segmenter";
 import "./style.css";
 
 const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite";
 const WASM_URL = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22-rc.20250304/wasm";
-type SegmentationMethod = "mediapipe" | "rvm-wasm" | "rvm-webgpu";
-let segmentationMethod: SegmentationMethod = navigator.gpu ? "rvm-webgpu" : "rvm-wasm";
+type SegmentationMethod = "mediapipe" | "rvm-wasm" | "rvm-webgpu" | "rvm-litert" | "rvm-litert-256";
+let segmentationMethod: SegmentationMethod = navigator.gpu ? "rvm-litert-256" : "rvm-wasm";
 let autoFrameEnabled = true;
+const selectedSegmentationOption = (method: SegmentationMethod) => segmentationMethod === method ? "selected" : "";
 
 const isRvmMethod = (method: SegmentationMethod): method is Exclude<SegmentationMethod, "mediapipe"> => method !== "mediapipe";
-const rvmProvider = (method: Exclude<SegmentationMethod, "mediapipe">) => method === "rvm-webgpu" ? "webgpu" : "wasm";
+const rvmProvider = (method: Exclude<SegmentationMethod, "mediapipe">) => {
+  if (method === "rvm-webgpu") return "webgpu";
+  if (method === "rvm-litert") return "litertWide";
+  if (method === "rvm-litert-256") return "litertSquare";
+  return "wasm";
+};
 
 const state: Look = {
   autoAdjust: true,
@@ -165,8 +172,10 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <span>Matte</span>
         <select id="segmentation-method">
           <option value="mediapipe">MediaPipe 256</option>
-          <option value="rvm-wasm" ${segmentationMethod === "rvm-wasm" ? "selected" : ""}>RVM · WASM</option>
-          <option value="rvm-webgpu" ${segmentationMethod === "rvm-webgpu" ? "selected" : ""} ${navigator.gpu ? "" : "disabled"}>RVM · WebGPU (TF.js)</option>
+          <option value="rvm-wasm" ${selectedSegmentationOption("rvm-wasm")}>RVM · WASM</option>
+          <option value="rvm-webgpu" ${selectedSegmentationOption("rvm-webgpu")} ${navigator.gpu ? "" : "disabled"}>RVM · WebGPU (TF.js)</option>
+          <option value="rvm-litert" ${selectedSegmentationOption("rvm-litert")} ${navigator.gpu ? "" : "disabled"}>RVM · LiteRT 512×288</option>
+          <option value="rvm-litert-256" ${selectedSegmentationOption("rvm-litert-256")} ${navigator.gpu ? "" : "disabled"}>RVM · LiteRT 256</option>
         </select>
       </label>
       <label class="matte-control" for="matte-threshold" title="Lower values include less-confident person pixels; higher values remove them">
@@ -277,7 +286,9 @@ class SegmenterPool {
 class RvmSegmenterPool {
   private models = {
     wasm: new RvmSegmenter(),
-    webgpu: new RvmTfjsSegmenter()
+    webgpu: new RvmTfjsSegmenter(),
+    litertWide: new RvmLiteRtSegmenter("wide"),
+    litertSquare: new RvmLiteRtSegmenter("square")
   };
   private busy = false;
   private queue: VideoSource[] = [];
@@ -288,14 +299,24 @@ class RvmSegmenterPool {
     const method = segmentationMethod;
     try {
       await this.models[rvmProvider(method)].load();
+      if (method === "rvm-litert" || method === "rvm-litert-256") this.updateLiteRtLabel(method);
     } catch (error) {
-      if (method !== "rvm-webgpu" || segmentationMethod !== method) throw error;
-      console.warn("RVM WebGPU initialization failed; falling back to WASM", error);
+      if ((method !== "rvm-webgpu" && method !== "rvm-litert" && method !== "rvm-litert-256") || segmentationMethod !== method) throw error;
+      console.warn("RVM GPU initialization failed; falling back to WASM", error);
       segmentationMethod = "rvm-wasm";
       document.querySelector<HTMLSelectElement>("#segmentation-method")!.value = segmentationMethod;
       setModelStatus("RVM WebGPU unavailable; using WASM");
       await this.models.wasm.load();
     }
+  }
+
+  private updateLiteRtLabel(method: "rvm-litert" | "rvm-litert-256") {
+    const option = document.querySelector<HTMLOptionElement>(`option[value="${method}"]`);
+    if (!option) return;
+    const model = method === "rvm-litert" ? this.models.litertWide : this.models.litertSquare;
+    const resolution = method === "rvm-litert" ? "512×288" : "256";
+    const mode = model.isFullyAccelerated ? "full GPU" : "mixed";
+    option.textContent = `RVM · LiteRT ${resolution} (${mode})`;
   }
 
   request(source: VideoSource) {
@@ -310,11 +331,15 @@ class RvmSegmenterPool {
     this.queue = this.queue.filter((item) => item !== source);
     this.models.wasm.reset(source);
     this.models.webgpu.reset(source);
+    this.models.litertWide.reset(source);
+    this.models.litertSquare.reset(source);
   }
 
   reset(source: VideoSource) {
     this.models.wasm.reset(source);
     this.models.webgpu.reset(source);
+    this.models.litertWide.reset(source);
+    this.models.litertSquare.reset(source);
   }
 
   private async drain() {
@@ -331,14 +356,16 @@ class RvmSegmenterPool {
       if (!frame) return;
       const method = segmentationMethod;
       if (!isRvmMethod(method)) return;
-      source.acceptMatte(await this.models[rvmProvider(method)].segment(source, frame));
+      const matte = await this.models[rvmProvider(method)].segment(source, frame);
+      if (segmentationMethod === method) source.acceptMatte(matte);
     } catch (error) {
       console.error("RVM inference failed", error);
-      if (segmentationMethod === "rvm-webgpu") {
+      if (segmentationMethod === "rvm-webgpu" || segmentationMethod === "rvm-litert" || segmentationMethod === "rvm-litert-256") {
+        const failedMethod = segmentationMethod;
         segmentationMethod = "rvm-wasm";
         document.querySelector<HTMLSelectElement>("#segmentation-method")!.value = segmentationMethod;
-        this.models.webgpu.reset(source);
-        setModelStatus("RVM WebGPU unavailable; using WASM");
+        this.models[rvmProvider(failedMethod)].reset(source);
+        setModelStatus("RVM GPU unavailable; using WASM");
         void this.models.wasm.load();
       } else {
         setModelStatus("RVM unavailable; select MediaPipe to continue");

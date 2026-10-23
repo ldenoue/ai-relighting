@@ -48,4 +48,8 @@ FSRCNN inference uses [Microsoft ONNX Runtime Web](https://github.com/microsoft/
 
 `public/models/rvm-tfjs/model.json` and `public/models/rvm-tfjs/group1-shard1of1.bin` are the official INT8 TensorFlow.js export from the same project’s `tfjs` branch. They provide the WebGPU-accelerated browser path through TensorFlow.js. TensorFlow.js is distributed under Apache License 2.0; the RVM graph and weights remain covered by RVM's GPL-3.0 license below.
 
+`public/models/rvm_mobilenetv3_512x288_fp16.tflite` and `public/models/rvm_mobilenetv3_256x256_fp16.tflite` are fixed-shape TFLite conversions of the official RVM MobileNetV3 SavedModel. They respectively have 512 × 288 and 256 × 256 NHWC RGB float32 inputs, float16 weights, float32 outputs, a fixed downsample ratio of 1, and four resolution-specific recurrent RVM state inputs and outputs. The converted graphs and weights remain covered by RVM's GPL-3.0 license.
+
+The TFLite model runs through [LiteRT.js](https://github.com/google-ai-edge/LiteRT), version 2.6.0, with its WebGPU accelerator and bundled browser WASM runtime. LiteRT.js is distributed under Apache License 2.0. A copy is included at [licenses/LITERT-APACHE-2.0.txt](licenses/LITERT-APACHE-2.0.txt).
+
 Robust Video Matting was developed at ByteDance Inc. by Shanchuan Lin, Linjie Yang, Imran Saleemi, and Soumyadip Sengupta. The upstream project was re-released under the GNU General Public License v3.0. A copy is included at [licenses/RVM-GPL-3.0.txt](licenses/RVM-GPL-3.0.txt). Distribution of this model therefore introduces GPL-3.0 obligations; review compatibility with the intended distribution model before treating this prototype as a proprietary product.
