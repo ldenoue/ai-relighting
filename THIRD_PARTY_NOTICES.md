@@ -52,4 +52,6 @@ FSRCNN inference uses [Microsoft ONNX Runtime Web](https://github.com/microsoft/
 
 The TFLite model runs through [LiteRT.js](https://github.com/google-ai-edge/LiteRT), version 2.6.0, with its WebGPU accelerator and bundled browser WASM runtime. LiteRT.js is distributed under Apache License 2.0. A copy is included at [licenses/LITERT-APACHE-2.0.txt](licenses/LITERT-APACHE-2.0.txt).
 
+The LiteRT input preprocessing shaders use [TypeGPU](https://github.com/software-mansion/TypeGPU) and its Vite build plugin to share LiteRT's WebGPU device and write normalized RGB pixels directly into the model's persistent GPU input buffer. TypeGPU is copyright © 2025 Software Mansion and is distributed under the MIT License. A copy is included at [licenses/TYPEGPU-MIT.txt](licenses/TYPEGPU-MIT.txt).
+
 Robust Video Matting was developed at ByteDance Inc. by Shanchuan Lin, Linjie Yang, Imran Saleemi, and Soumyadip Sengupta. The upstream project was re-released under the GNU General Public License v3.0. A copy is included at [licenses/RVM-GPL-3.0.txt](licenses/RVM-GPL-3.0.txt). Distribution of this model therefore introduces GPL-3.0 obligations; review compatibility with the intended distribution model before treating this prototype as a proprietary product.

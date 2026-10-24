@@ -7,6 +7,7 @@ import {
   type CompiledModel
 } from "@litertjs/core";
 import type { RvmMatte } from "./rvm-segmenter";
+import { RvmGpuInputPipeline } from "./rvm-gpu-input-pipeline";
 
 const WASM_URL = `${import.meta.env.BASE_URL}litert-wasm/`;
 const PROFILES = {
@@ -69,8 +70,10 @@ export class RvmLiteRtSegmenter {
   private inputCanvas = document.createElement("canvas");
   private inputContext = this.inputCanvas.getContext("2d", { alpha: false, willReadFrequently: true })!;
   private recurrent = new WeakMap<object, Record<string, Tensor>>();
+  private gpuInputs = new WeakMap<object, RvmGpuInputPipeline>();
   private compiled?: CompiledModel;
   private profile: (typeof PROFILES)[RvmLiteRtProfile];
+  private gpuInputAvailable = true;
 
   constructor(private profileName: RvmLiteRtProfile) {
     this.profile = PROFILES[profileName];
@@ -89,18 +92,11 @@ export class RvmLiteRtSegmenter {
   reset(source: object) {
     deleteTensors(this.recurrent.get(source));
     this.recurrent.delete(source);
+    this.gpuInputs.get(source)?.destroy();
+    this.gpuInputs.delete(source);
   }
 
-  async segment(source: object, frame: CanvasImageSource): Promise<RvmMatte> {
-    const model = this.compiled ?? await modelResource(this.profileName);
-    this.compiled = model;
-    const { width, height } = this.profile;
-    const matteSize = Math.min(width, height);
-    const squareOffsetX = (width - matteSize) / 2;
-
-    // Our renderer consumes a square matte. Preserve that geometry inside the
-    // wide LiteRT graph, then crop the square alpha region back out. The 256
-    // profile is already square, so this draw and crop are both one-to-one.
+  private createCpuInput(frame: CanvasImageSource, width: number, height: number, matteSize: number, squareOffsetX: number) {
     this.inputContext.fillStyle = "black";
     this.inputContext.fillRect(0, 0, width, height);
     this.inputContext.drawImage(frame, squareOffsetX, 0, matteSize, matteSize);
@@ -111,8 +107,49 @@ export class RvmLiteRtSegmenter {
       rgb[targetIndex++] = rgba[sourceIndex + 1] / 255;
       rgb[targetIndex++] = rgba[sourceIndex + 2] / 255;
     }
+    return new Tensor(rgb, [1, height, width, 3]);
+  }
 
-    const input = new Tensor(rgb, [1, height, width, 3]);
+  private createGpuInput(source: object, frame: CanvasImageSource, width: number, height: number) {
+    const dimensions = frame instanceof HTMLVideoElement
+      ? [frame.videoWidth, frame.videoHeight]
+      : [Number((frame as { width?: number }).width), Number((frame as { height?: number }).height)];
+    const [sourceWidth, sourceHeight] = dimensions;
+    if (!sourceWidth || !sourceHeight) throw new Error("RVM source dimensions are unavailable");
+    let pipeline = this.gpuInputs.get(source);
+    if (!pipeline?.matches(sourceWidth, sourceHeight)) {
+      pipeline?.destroy();
+      pipeline = RvmGpuInputPipeline.create(sourceWidth, sourceHeight, width, height);
+      this.gpuInputs.set(source, pipeline);
+    }
+    return pipeline.createInputTensor(frame as GPUCopyExternalImageSource);
+  }
+
+  async segment(source: object, frame: CanvasImageSource): Promise<RvmMatte> {
+    const model = this.compiled ?? await modelResource(this.profileName);
+    this.compiled = model;
+    const { width, height } = this.profile;
+    const matteSize = Math.min(width, height);
+    const squareOffsetX = (width - matteSize) / 2;
+
+    // TypeGPU writes normalized RGB directly into a persistent GPUBuffer that
+    // LiteRT consumes on the same GPUDevice. Keep the CPU conversion as a
+    // compatibility fallback if the shared-device path is unavailable.
+    let input: Tensor;
+    if (this.gpuInputAvailable) {
+      try {
+        input = this.createGpuInput(source, frame, width, height);
+      } catch (error) {
+        this.gpuInputAvailable = false;
+        this.gpuInputs.get(source)?.destroy();
+        this.gpuInputs.delete(source);
+        console.warn("RVM GPU preprocessing unavailable; using CPU pixels", error);
+        input = this.createCpuInput(frame, width, height, matteSize, squareOffsetX);
+      }
+    } else {
+      input = this.createCpuInput(frame, width, height, matteSize, squareOffsetX);
+    }
+
     const previous = this.recurrent.get(source) ?? zeroState(width, height);
     let outputs: Record<string, Tensor>;
     try {

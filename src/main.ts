@@ -13,6 +13,7 @@ let autoFrameEnabled = true;
 const selectedSegmentationOption = (method: SegmentationMethod) => segmentationMethod === method ? "selected" : "";
 
 const isRvmMethod = (method: SegmentationMethod): method is Exclude<SegmentationMethod, "mediapipe"> => method !== "mediapipe";
+const isLiteRtMethod = (method: SegmentationMethod) => method === "rvm-litert" || method === "rvm-litert-256";
 const rvmProvider = (method: Exclude<SegmentationMethod, "mediapipe">) => {
   if (method === "rvm-webgpu") return "webgpu";
   if (method === "rvm-litert") return "litertWide";
@@ -352,10 +353,10 @@ class RvmSegmenterPool {
     }
     this.busy = true;
     try {
-      const frame = source.captureSegmentationFrame();
-      if (!frame) return;
       const method = segmentationMethod;
       if (!isRvmMethod(method)) return;
+      const frame = isLiteRtMethod(method) ? source.captureLiteRtFrame() : source.captureSegmentationFrame();
+      if (!frame) return;
       const matte = await this.models[rvmProvider(method)].segment(source, frame);
       if (segmentationMethod === method) source.acceptMatte(matte);
     } catch (error) {
@@ -673,7 +674,10 @@ class VideoSource {
   private tick = () => {
     if (!this.active) return;
     if (state.isolate) {
-      if (!this.hasPairedFrame) this.captureSegmentationFrame();
+      if (!this.hasPairedFrame && !this.pendingFrame.width) {
+        if (isLiteRtMethod(segmentationMethod)) this.captureLiteRtFrame();
+        else this.captureSegmentationFrame();
+      }
       const displayFrame = this.hasPairedFrame ? this.pairedFrame : this.pendingFrame;
       this.renderer.render(displayFrame, state, this.sourceTextureDirty);
       this.sourceTextureDirty = false;
@@ -693,7 +697,7 @@ class VideoSource {
     requestAnimationFrame(this.tick);
   };
 
-  captureSegmentationFrame() {
+  private captureSourceFrame() {
     if (this.video.readyState < 2 || !this.video.videoWidth) return undefined;
     const renderSize = Math.min(1280, Math.max(512, Math.max(this.video.videoWidth, this.video.videoHeight)));
     if (this.pendingFrame.width !== renderSize || this.pendingFrame.height !== renderSize) {
@@ -701,12 +705,6 @@ class VideoSource {
       this.pendingFrame.height = renderSize;
       this.pendingCtx.imageSmoothingEnabled = true;
       this.pendingCtx.imageSmoothingQuality = "high";
-    }
-    if (this.segmentationFrame.width !== 256 || this.segmentationFrame.height !== 256) {
-      this.segmentationFrame.width = 256;
-      this.segmentationFrame.height = 256;
-      this.segmentationCtx.imageSmoothingEnabled = true;
-      this.segmentationCtx.imageSmoothingQuality = "high";
     }
     const [red, green, blue] = state.referenceBackgroundColor.map((channel) => Math.round(channel * 255));
     this.pendingCtx.fillStyle = `rgb(${red} ${green} ${blue})`;
@@ -719,8 +717,24 @@ class VideoSource {
     // Draw the decoded video once, then derive the model input from this exact
     // high-resolution snapshot so the display frame and matte stay paired.
     this.pendingCtx.drawImage(this.video, x, y, width, height);
-    this.segmentationCtx.drawImage(this.pendingFrame, 0, 0, 256, 256);
     if (!this.hasPairedFrame) this.sourceTextureDirty = true;
+    return this.pendingFrame;
+  }
+
+  captureLiteRtFrame() {
+    return this.captureSourceFrame();
+  }
+
+  captureSegmentationFrame() {
+    const sourceFrame = this.captureSourceFrame();
+    if (!sourceFrame) return undefined;
+    if (this.segmentationFrame.width !== 256 || this.segmentationFrame.height !== 256) {
+      this.segmentationFrame.width = 256;
+      this.segmentationFrame.height = 256;
+      this.segmentationCtx.imageSmoothingEnabled = true;
+      this.segmentationCtx.imageSmoothingQuality = "high";
+    }
+    this.segmentationCtx.drawImage(sourceFrame, 0, 0, 256, 256);
     return this.segmentationFrame;
   }
 

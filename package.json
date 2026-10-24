@@ -14,11 +14,13 @@
     "@tensorflow/tfjs": "^4.22.0",
     "@tensorflow/tfjs-backend-webgpu": "^4.22.0",
     "@websr/websr": "^0.0.16",
-    "onnxruntime-web": "^1.27.0"
+    "onnxruntime-web": "^1.27.0",
+    "typegpu": "^0.12.9"
   },
   "devDependencies": {
     "@webgpu/types": "^0.1.68",
     "typescript": "^5.7.2",
+    "unplugin-typegpu": "^0.12.7",
     "vite": "^6.1.0"
   }
 }
